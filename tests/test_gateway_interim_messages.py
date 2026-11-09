@@ -258,7 +258,7 @@ def relay(frames, **kwargs):
 def test_live_interim_order_and_final_separation():
     result, events, seqs = relay([
         frame('message.interim', 1, text='  Checking files.  ', already_streamed=False),
-        frame('tool.started', 2, name='terminal', args={'command':'pwd'}, tool_call_id='t1'),
+        frame('tool.started', 2, tool='terminal', preview='pwd', tool_call_id='t1'),
         frame('message.delta', 3, delta='Final answer.'),
         frame('run.completed', 4, output='Final answer.'),
     ])

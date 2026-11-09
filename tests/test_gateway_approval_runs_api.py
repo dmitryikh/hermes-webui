@@ -520,7 +520,7 @@ def test_gateway_approval_event_translation():
         "pattern_key": "dangerous_command",
         "pattern_keys": ["dangerous_command"],
         "run_id": "run-999",
-        "approval_id": "appr-1",
+        "request_id": "appr-1",
         "choices": ["once", "session", "always", "deny"],
     }
     result = _gateway_runs_approval_event(payload)
@@ -535,16 +535,8 @@ def test_gateway_approval_event_translation():
     assert result["risk_level"] == "high"
     assert result["run_id"] == "run-999"
     assert result["approval_id"] == "appr-1"
-    empty_id = _gateway_runs_approval_event({**payload, "approval_id": "", "id": ""})
-    import api.route_approvals as approvals
-    sid = "translation-empty-id"
-    try:
-        approvals.submit_gateway_pending_mirror(sid, empty_id)
-        mirror = approvals.gateway_pending_mirror(sid, run_id="run-999")
-        assert mirror["approval_id"]
-        assert mirror.get("_gateway_agent_identity_v1") is not True
-    finally:
-        approvals._pending.pop(sid, None)
+    # Every Gateway prompt carries its id; WebUI never mints one.
+    assert _gateway_runs_approval_event({**payload, "request_id": ""}) is None
 
     downgraded = _gateway_runs_approval_event({
         "command": "rm -rf /tmp/x",
@@ -552,6 +544,7 @@ def test_gateway_approval_event_translation():
         "pattern_key": "dangerous_command",
         "pattern_keys": ["dangerous_command"],
         "allow_permanent": False,
+        "request_id": "appr-downgraded",
         "choices": ["once", "session", "always", "deny"],
     })
     assert downgraded is not None
@@ -604,7 +597,7 @@ def test_gateway_runs_api_streaming_parses_real_run_events():
         if req.full_url.endswith("/v1/runs"):
             return _JsonResponse({"run_id": "run-abc"})
         return _SseResponse([
-            b'data: {"event":"approval.request","command":"rm -rf /tmp/x","description":"Dangerous command approval","pattern_key":"dangerous_command","pattern_keys":["dangerous_command"],"choices":["once","session","always","deny"],"run_id":"run-abc","approval_id":"appr-1"}\n',
+            b'data: {"event":"approval.request","command":"rm -rf /tmp/x","description":"Dangerous command approval","pattern_key":"dangerous_command","pattern_keys":["dangerous_command"],"choices":["once","session","always","deny"],"run_id":"run-abc","request_id":"appr-1"}\n',
             b'\n',
             b'data: {"event":"reasoning.available","text":"thinking..."}\n',
             b'\n',
@@ -660,219 +653,6 @@ def test_gateway_runs_api_streaming_parses_real_run_events():
     assert approvals.gateway_pending_mirror("sess1", run_id="run-abc") is None
 
 
-def test_live_empty_ingress_id_stays_fifo_under_capability_v1():
-    """A normalized fallback browser ID must not become authoritative Agent identity."""
-    from api.config import STREAM_PARTIAL_TEXT, STREAM_REASONING_TEXT
-    from api.gateway_chat import _STREAM_RUN_IDS, _gateway_runs_approval_event, _run_gateway_runs_api_streaming
-    from api import routes
-    import api.route_approvals as approvals
-
-    sid = "sid-live-empty-ingress"
-    stream_id = "stream-live-empty-ingress"
-    events = []
-    normalized = _gateway_runs_approval_event({
-        "command": "rm -rf /tmp/x", "description": "Dangerous",
-        "run_id": "run-empty-ingress", "approval_id": "", "id": "",
-    })
-    assert normalized["approval_id"]
-    assert normalized["_gateway_raw_approval_id_present"] is False
-    STREAM_PARTIAL_TEXT[stream_id] = ""
-    STREAM_REASONING_TEXT[stream_id] = ""
-
-    class _JsonResponse:
-        def read(self, _limit=None):
-            return b'{"run_id":"run-empty-ingress"}'
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return None
-
-    class _SseResponse:
-        def __iter__(self):
-            return iter([
-                b'data: {"event":"approval.request","command":"rm -rf /tmp/x","description":"Dangerous","run_id":"run-empty-ingress","approval_id":"","id":""}\n',
-                b'\n',
-                b'data: [DONE]\n',
-                b'\n',
-            ])
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return None
-
-    class _ReattachedSseResponse:
-        # reconnect after [DONE]: the already-consumed event window replays empty
-        def __iter__(self):
-            return iter([])
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return None
-
-    events_connects = 0
-
-    def fake_urlopen(req, *, timeout=None):
-        nonlocal events_connects
-        if req.full_url.endswith("/v1/runs"):
-            return _JsonResponse()
-        # durable-status probe from the watchdog (run ended via [DONE] without a terminal frame):
-        # no durable record for this run, so the second consecutive 404 fails
-        # the turn closed while the approval mirror stays pending. A terminal
-        # status answer would settle the run and retire the mirror before the
-        # assertions below can read it.
-        if req.full_url.endswith("/v1/runs/run-empty-ingress"):
-            raise urllib.error.HTTPError(req.full_url, 404, "Not Found", None, None)
-        if req.full_url.endswith("/events"):
-            events_connects += 1
-            return _SseResponse() if events_connects == 1 else _ReattachedSseResponse()
-        return _SseResponse()
-
-    handler = MagicMock()
-    handler.wfile = io.BytesIO()
-    try:
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen), \
-             patch("api.config.gateway_supports_approval_identity_v1", return_value=True):
-            with pytest.raises(RuntimeError, match="no longer has the run"):
-                _run_gateway_runs_api_streaming(
-                    session_id=sid, msg_text="hi", model="test-model", workspace="/tmp",
-                    stream_id=stream_id, base_url="http://gw:8642", api_key="secret",
-                    prefill_messages=[], body_extras={}, put_gateway_event=lambda event, data: events.append((event, data)),
-                    cancel_event=threading.Event(),
-                )
-            mirror = approvals.gateway_pending_mirror(sid, run_id="run-empty-ingress")
-            browser_id = mirror["approval_id"]
-            with patch("api.routes.get_session", return_value=SimpleNamespace(active_stream_id=stream_id)), \
-                 patch("api.config.gateway_supports_approval_identity_v1", return_value=True), \
-                 patch("api.runner_client.HttpRunnerClient.respond_approval") as respond:
-                routes._handle_approval_respond(handler, {
-                    "session_id": sid, "choice": "once", "approval_id": browser_id,
-                })
-                respond.assert_called_once_with("run-empty-ingress", "", "once")
-    finally:
-        STREAM_PARTIAL_TEXT.pop(stream_id, None)
-        STREAM_REASONING_TEXT.pop(stream_id, None)
-        _STREAM_RUN_IDS.pop(stream_id, None)
-
-    assert events[0][0] == "approval"
-    assert events[0][1]["approval_id"]
-    assert events[0][1]["_gateway_raw_approval_id_present"] is False
-    assert events[0][1]["_gateway_agent_identity_v1"] is False
-    assert mirror["approval_id"] == events[0][1]["approval_id"]
-    assert mirror["_gateway_raw_approval_id_present"] is False
-    assert mirror["_gateway_agent_identity_v1"] is False
-    approvals._pending.pop(sid, None)
-    approvals._gateway_queues.pop(sid, None)
-
-
-def test_live_authoritative_ingress_id_relays_exactly_under_capability_v1():
-    """A raw Agent-issued approval ID becomes authoritative only through live ingress."""
-    from api.config import STREAM_PARTIAL_TEXT, STREAM_REASONING_TEXT
-    from api.gateway_chat import _STREAM_RUN_IDS, _run_gateway_runs_api_streaming
-    from api import routes
-    import api.route_approvals as approvals
-
-    sid = "sid-live-authoritative-ingress"
-    stream_id = "stream-live-authoritative-ingress"
-    events = []
-    STREAM_PARTIAL_TEXT[stream_id] = ""
-    STREAM_REASONING_TEXT[stream_id] = ""
-
-    class _JsonResponse:
-        def read(self, _limit=None):
-            return b'{"run_id":"run-authoritative-ingress"}'
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return None
-
-    class _SseResponse:
-        def __iter__(self):
-            return iter([
-                b'data: {"event":"approval.request","command":"echo hi","description":"Safe","run_id":"run-authoritative-ingress","approval_id":"agent-approval-1","id":"agent-approval-legacy"}\n',
-                b'\n',
-                b'data: [DONE]\n',
-                b'\n',
-            ])
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return None
-
-    class _ReattachedSseResponse:
-        # reconnect after [DONE]: the already-consumed event window replays empty
-        def __iter__(self):
-            return iter([])
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            return None
-
-    events_connects = 0
-
-    def fake_urlopen(req, *, timeout=None):
-        nonlocal events_connects
-        if req.full_url.endswith("/v1/runs"):
-            return _JsonResponse()
-        # durable-status probe from the watchdog (run ended via [DONE] without a terminal frame):
-        # no durable record for this run, so the second consecutive 404 fails
-        # the turn closed while the approval mirror stays pending. A terminal
-        # status answer would settle the run and retire the mirror before the
-        # assertions below can read it.
-        if req.full_url.endswith("/v1/runs/run-authoritative-ingress"):
-            raise urllib.error.HTTPError(req.full_url, 404, "Not Found", None, None)
-        if req.full_url.endswith("/events"):
-            events_connects += 1
-            return _SseResponse() if events_connects == 1 else _ReattachedSseResponse()
-        return _SseResponse()
-
-    handler = MagicMock()
-    handler.wfile = io.BytesIO()
-    try:
-        with patch("urllib.request.urlopen", side_effect=fake_urlopen), \
-             patch("api.config.gateway_supports_approval_identity_v1", return_value=True):
-            with pytest.raises(RuntimeError, match="no longer has the run"):
-                _run_gateway_runs_api_streaming(
-                    session_id=sid, msg_text="hi", model="test-model", workspace="/tmp",
-                    stream_id=stream_id, base_url="http://gw:8642", api_key="secret",
-                    prefill_messages=[], body_extras={}, put_gateway_event=lambda event, data: events.append((event, data)),
-                    cancel_event=threading.Event(),
-                )
-            mirror = approvals.gateway_pending_mirror(
-                sid, approval_id="agent-approval-1", run_id="run-authoritative-ingress"
-            )
-            with patch("api.routes.get_session", return_value=SimpleNamespace(active_stream_id=stream_id)), \
-                 patch("api.config.gateway_supports_approval_identity_v1", return_value=True), \
-                 patch("api.runner_client.HttpRunnerClient.respond_approval") as respond:
-                routes._handle_approval_respond(handler, {
-                    "session_id": sid, "choice": "once", "approval_id": "agent-approval-1",
-                })
-                respond.assert_called_once_with("run-authoritative-ingress", "agent-approval-1", "once")
-    finally:
-        STREAM_PARTIAL_TEXT.pop(stream_id, None)
-        STREAM_REASONING_TEXT.pop(stream_id, None)
-        _STREAM_RUN_IDS.pop(stream_id, None)
-
-    assert events[0][0] == "approval"
-    assert events[0][1]["approval_id"] == "agent-approval-1"
-    assert events[0][1]["_gateway_agent_identity_v1"] is True
-    assert mirror["approval_id"] == "agent-approval-1"
-    assert mirror["_gateway_agent_identity_v1"] is True
-    approvals._pending.pop(sid, None)
-    approvals._gateway_queues.pop(sid, None)
-
-
 def test_gateway_runs_api_streaming_same_run_fifo_emits_head_and_promotes_successor():
     """Runs API approval events publish the reconciled FIFO head and count."""
     from api.config import STREAM_PARTIAL_TEXT, STREAM_REASONING_TEXT
@@ -899,9 +679,9 @@ def test_gateway_runs_api_streaming_same_run_fifo_emits_head_and_promotes_succes
     class _SseResponse:
         def __iter__(self):
             return iter([
-                b'data: {"event":"approval.request","command":"first","description":"First","run_id":"run-fifo","approval_id":"approval-first"}\n',
+                b'data: {"event":"approval.request","command":"first","description":"First","run_id":"run-fifo","request_id":"approval-first"}\n',
                 b'\n',
-                b'data: {"event":"approval.request","command":"second","description":"Second","run_id":"run-fifo","approval_id":"approval-second"}\n',
+                b'data: {"event":"approval.request","command":"second","description":"Second","run_id":"run-fifo","request_id":"approval-second"}\n',
                 b'\n',
                 b'data: [DONE]\n',
                 b'\n',
@@ -982,7 +762,7 @@ def test_gateway_runs_api_streaming_same_run_fifo_emits_head_and_promotes_succes
         approvals._gateway_queues.pop(sid, None)
 
 
-def test_empty_id_runs_approval_reaches_real_response_lifecycle():
+def test_in_process_runs_approval_reaches_real_response_lifecycle():
     """Runs API empty IDs are carried and resolved through the live mirror."""
     from api.gateway_chat import _run_gateway_runs_api_streaming
     import api.route_approvals as approvals
@@ -1006,7 +786,7 @@ def test_empty_id_runs_approval_reaches_real_response_lifecycle():
             def __iter__(self):
                 return iter([
                     b'data: {"event":"approval.request","command":"echo x",'
-                    b'"description":"approval","approval_id":""}\n',
+                    b'"description":"approval","request_id":"appr-real"}\n',
                     b'\n', b'data: [DONE]\n', b'\n'
                 ])
             def __enter__(self):
@@ -3278,7 +3058,6 @@ def test_synthetic_gateway_identity_stays_fifo_after_capability_upgrade():
     handler = MagicMock()
     handler.wfile = io.BytesIO()
     with patch("api.routes.get_session", return_value=SimpleNamespace(active_stream_id="sid-upgrade")), \
-         patch("api.config.gateway_supports_approval_identity_v1", return_value=True), \
          patch("api.runner_client.HttpRunnerClient.respond_approval") as respond:
         routes._handle_approval_respond(handler, {
             "session_id": "sess-upgrade", "choice": "once", "approval_id": "gwrun:run-upgrade:local",
@@ -3304,7 +3083,6 @@ def test_agent_identity_v1_relays_the_ingress_identity_exactly():
     handler = MagicMock()
     handler.wfile = io.BytesIO()
     with patch("api.routes.get_session", return_value=SimpleNamespace(active_stream_id="sid-v1")), \
-         patch("api.config.gateway_supports_approval_identity_v1", return_value=True), \
          patch("api.runner_client.HttpRunnerClient.respond_approval") as respond:
         routes._handle_approval_respond(handler, {
             "session_id": "sess-v1", "choice": "once", "approval_id": "agent-v1",
@@ -3331,7 +3109,6 @@ def test_capability_v1_empty_ingress_identity_stays_fifo_only():
     handler = MagicMock()
     handler.wfile = io.BytesIO()
     with patch("api.routes.get_session", return_value=SimpleNamespace(active_stream_id="sid-v1-empty")), \
-         patch("api.config.gateway_supports_approval_identity_v1", return_value=True), \
          patch("api.runner_client.HttpRunnerClient.respond_approval") as respond:
         routes._handle_approval_respond(handler, {
             "session_id": "sess-v1-empty", "choice": "once", "approval_id": mirror["approval_id"],
@@ -3477,7 +3254,6 @@ def test_identityless_gateway_relay_duplicate_response_is_single_flight():
 
         with patch("api.gateway_chat._gateway_base_url", return_value="http://gw:8642"), \
              patch("api.gateway_chat._gateway_api_key", return_value=""), \
-             patch("api.config.gateway_supports_approval_identity_v1", return_value=False), \
              patch("api.runner_client.HttpRunnerClient.respond_approval", side_effect=blocked_respond):
             t1 = threading.Thread(
                 target=_invoke_gateway_approval_response,
@@ -3537,7 +3313,6 @@ def test_identityless_gateway_relay_conflicting_duplicate_choice_returns_busy():
 
         with patch("api.gateway_chat._gateway_base_url", return_value="http://gw:8642"), \
              patch("api.gateway_chat._gateway_api_key", return_value=""), \
-             patch("api.config.gateway_supports_approval_identity_v1", return_value=False), \
              patch("api.runner_client.HttpRunnerClient.respond_approval", side_effect=blocked_respond):
             t1 = threading.Thread(
                 target=_invoke_gateway_approval_response,
@@ -3598,7 +3373,6 @@ def test_identityless_gateway_relay_failure_releases_owner_for_retry():
 
         with patch("api.gateway_chat._gateway_base_url", return_value="http://gw:8642"), \
              patch("api.gateway_chat._gateway_api_key", return_value=""), \
-             patch("api.config.gateway_supports_approval_identity_v1", return_value=False), \
              patch("api.runner_client.HttpRunnerClient.respond_approval", side_effect=flaky_respond):
             t1 = threading.Thread(
                 target=_invoke_gateway_approval_response,
@@ -3668,7 +3442,6 @@ def test_identityless_gateway_relay_keeps_different_runs_parallel():
 
         with patch("api.gateway_chat._gateway_base_url", return_value="http://gw:8642"), \
              patch("api.gateway_chat._gateway_api_key", return_value=""), \
-             patch("api.config.gateway_supports_approval_identity_v1", return_value=False), \
              patch("api.runner_client.HttpRunnerClient.respond_approval", side_effect=parallel_respond):
             t1 = threading.Thread(
                 target=_invoke_gateway_approval_response,
@@ -3729,7 +3502,6 @@ def test_identityless_gateway_relay_revalidates_head_after_claim_and_releases_ow
 
         with patch("api.gateway_chat._gateway_base_url", return_value="http://gw:8642"), \
              patch("api.gateway_chat._gateway_api_key", return_value=""), \
-             patch("api.config.gateway_supports_approval_identity_v1", return_value=False), \
              patch("api.routes.gateway_pending_mirror", side_effect=advance_head_after_claim), \
              patch("api.runner_client.HttpRunnerClient.respond_approval") as respond:
             results = {}

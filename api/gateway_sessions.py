@@ -293,7 +293,7 @@ class SessionRelay:
             # confirms the interrupt. Never auto-approve it or show a card.
             return
         self.approvals[prompt_id] = generation
-        data = _gateway_runs_approval_event({**payload, "approval_id": prompt_id})
+        data = _gateway_runs_approval_event(payload)
         if data is None:
             data = {"approval_id": prompt_id, "description": "Gateway tool approval", "choices": ["once", "deny"]}
         data.update(run_id=self.run_id, _gateway_agent_identity_v1=True)

@@ -93,20 +93,22 @@ def test_runs_decoder_types_every_hermes_event():
     )
     assert events({"event": "message.interim", "text": "   "}) == ()
     assert events({"event": "reasoning.available", "text": "hmm"}) == (ReasoningDelta("hmm"),)
-    (tool,) = events({"event": "tool.completed", "tool": "terminal", "tool_call_id": "t1", "error": "x"})
+    (tool,) = events({"event": "tool.completed", "tool": "terminal", "tool_call_id": "t1", "error": True})
     assert tool == ToolProgress(completed=True, name="terminal", args={}, is_error=True, tid="t1")
     assert events({"event": "tool.started", "tool": "_internal"}) == ()
     assert events({"event": "replay.truncated"}) == (ReplayTruncated(),)
     approval = {"event": "approval.request", "command": "ls"}
     assert events(approval) == (ApprovalRequest(approval),)
-    completed = {"event": "run.completed", "output": "done", "usage": {"prompt_tokens": 3}}
+    completed = {"event": "run.completed", "output": "done", "usage": {"input_tokens": 3, "output_tokens": 0}}
     assert events(completed) == (RunCompleted("done", {"input_tokens": 3}, "", completed),)
     failed = {"event": "run.failed"}
     assert events(failed) == (RunFailed("Gateway run failed", failed),)
-    cancelled = {"type": "run.cancelled"}
-    assert events(cancelled) == (RunCancelled(cancelled),)
-    chunk = {"choices": [{"delta": {"reasoning_content": "r", "content": "c"}}], "usage": {"output_tokens": 2}}
-    assert events(chunk) == (ReasoningDelta("r"), TextDelta("c"), UsageReport({"output_tokens": 2}))
+    for name in ("run.cancelled", "run.interrupted"):
+        cancelled = {"event": name}
+        assert events(cancelled) == (RunCancelled(cancelled),)
+    # Lifecycle/subagent events and untyped payloads are not rendered.
+    assert events({"event": "run.started"}) == ()
+    assert events({"choices": [{"delta": {"content": "c"}}]}) == ()
 
 
 def test_chat_completion_decoder_routes_hermes_extensions_by_sse_event():
@@ -114,17 +116,24 @@ def test_chat_completion_decoder_routes_hermes_extensions_by_sse_event():
     assert decode_chat_completion_frame(SseFrame("hermes.tool.progress", json.dumps(tool))).events == (
         ToolProgress(completed=False, name="terminal"),
     )
+    # Reasoning rides on chunks as ``delta.reasoning_content``.
     assert decode_chat_completion_frame(
-        SseFrame("reasoning.available", json.dumps({"preview": "thinking"}))
+        data({"choices": [{"delta": {"reasoning_content": "thinking"}}]})
     ).events == (ReasoningDelta("thinking"),)
     # Without the SSE event name the same payload is just an (empty) chunk.
     assert decode_chat_completion_frame(data(tool)).events == ()
-    assert decode_chat_completion_frame(data({"error": "boom"})).events == (ChunkError("boom"),)
+    # A failed turn ends with an ``error`` finish chunk; the message is optional.
+    failed = {"choices": [{"delta": {}, "finish_reason": "error"}], "error": {"message": "boom", "type": "agent_error"}}
+    assert decode_chat_completion_frame(data(failed)).events == (ChunkError("boom"),)
+    crashed = {"choices": [{"delta": {}, "finish_reason": "error"}]}
+    assert decode_chat_completion_frame(data(crashed)).events == (ChunkError("Gateway run failed"),)
+    assert decode_chat_completion_frame(SseFrame("hermes.status", json.dumps({"x": 1}))).events == ()
 
 
 def test_session_decoder_maps_canonical_content_events():
     assert decode_session_event("message.delta", {"text": "a"}) == TextDelta("a")
-    assert decode_session_event("thinking.delta", {"delta": "b"}) == ReasoningDelta("b")
+    assert decode_session_event("thinking.delta", {"text": "b"}) == ReasoningDelta("b")
+    assert decode_session_event("message.delta", {"text": None}) is None  # segment boundary
     assert decode_session_event("reasoning.delta", {"text": ""}) is None
     assert decode_session_event("tool.complete", {"name": "x", "tool_call_id": "t", "is_error": True}) == (
         ToolProgress(completed=True, name="x", is_error=True, tid="t")

@@ -428,21 +428,27 @@ def run_turn(*, urlopen_script=(), status_script=(), cancel_event=None, clock=No
             return fn(*a, **k)
         return call
 
-    patch(gc, "time", types.SimpleNamespace(monotonic=clock.monotonic))
-    patch(gc, "_admit_gateway_run", lambda *a, **k: RUN_ID)
-    patch(gc, "_get_gateway_run_status", traced("status", status))
-    patch(gc, "_settle_gateway_cancelled_turn", traced_cancel_settle)
-    patch(urllib.request, "urlopen", traced("events", urlopen))
-    for obj, name, value in extra_patches:
-        patch(obj, name, value)
-
     import api.route_approvals as ra
 
     def fake_settle(session_key, run_id, *, reason):
         settles.append(reason)
         return 0, None, 0
 
-    patch(ra, "settle_gateway_pending_run", fake_settle)
+    try:
+        patch(gc, "time", types.SimpleNamespace(monotonic=clock.monotonic))
+        patch(gc, "_admit_gateway_run", lambda *a, **k: RUN_ID)
+        patch(gc, "_get_gateway_run_status", traced("status", status))
+        patch(gc, "_settle_gateway_cancelled_turn", traced_cancel_settle)
+        patch(urllib.request, "urlopen", traced("events", urlopen))
+        for obj, name, value in extra_patches:
+            patch(obj, name, value)
+        patch(ra, "settle_gateway_pending_run", fake_settle)
+    except BaseException:
+        # A patch that cannot be applied must not leak the ones already applied
+        # (a leaked fake ``time`` breaks every later Gateway test).
+        for obj, name, value in reversed(saved):
+            setattr(obj, name, value)
+        raise
 
     _config.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
     saved_log_level = gc.logger.level
@@ -902,7 +908,7 @@ def test_r5_run_completed_breaks_out_of_infinite_postterminal_keepalives():
             "description": "Dangerous command approval",
             "pattern_key": "dangerous_command",
             "pattern_keys": ["dangerous_command"],
-            "choices": ["once", "always"], "approval_id": "appr-r5-1",
+            "choices": ["once", "always"], "request_id": "appr-r5-1",
         })
         + sse_frame(2, {"event": "message.delta", "delta": "streamed "})
         + sse_frame(3, {
@@ -922,7 +928,6 @@ def test_r5_run_completed_breaks_out_of_infinite_postterminal_keepalives():
         extra_patches=[
             (gc, "_settle_gateway_run_approval",
              lambda *a, **k: approval_settles.append(k) or (True, {"approval_id": "appr-r5-1"}, 0)),
-            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: False),
         ],
         on_seq=committed_seqs.append,
     )
@@ -955,8 +960,8 @@ def test_r5_event_header_framed_terminal_frame_breaks_out_of_keepalives():
 
     clock = FakeClock()
     stream = InfiniteKeepaliveSseResponse(
-        [b"event: message.delta", b"data: " + json.dumps({"delta": "streamed "}).encode(), b""]
-        + [b"event: run.completed", b"data: " + json.dumps({"output": "Hello"}).encode(), b""],
+        [b"event: message.delta", b"data: " + json.dumps({"event": "message.delta", "delta": "streamed "}).encode(), b""]
+        + [b"event: run.completed", b"data: " + json.dumps({"event": "run.completed", "output": "Hello"}).encode(), b""],
         clock=clock, advance_per_line=60.0,
     )
     harness = run_turn(
@@ -967,7 +972,6 @@ def test_r5_event_header_framed_terminal_frame_breaks_out_of_keepalives():
             {"status": "completed", "output": "status-poll-text"},
         ],
         extra_patches=[
-            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: False),
         ],
     )
     result = harness["result"]
@@ -1078,8 +1082,8 @@ def test_r4_stop_during_byte_silence_cancels_within_budget():
 
 def test_r4_status_waiting_for_approval_surfaces_approval_card_once():
     """Round-4 Greptile item 4, identity-gateway contract (round-4 maintainer
-    must-fix): on a gateway advertising ``approval_identity_v1``, a durable
-    status of ``waiting_for_approval`` carrying the approval payload surfaces
+    must-fix): for a generation-fenced prompt, a durable status of
+    ``waiting_for_approval`` carrying the approval payload surfaces
     the card exactly once (mirroring the reattach path's parked-approval
     surface), even when the events feed never delivered it. A re-probe
     carrying the same approval key must NOT double-card, and a later
@@ -1090,7 +1094,8 @@ def test_r4_status_waiting_for_approval_surfaces_approval_card_once():
 
     clock = FakeClock()
     approval_payload = {
-        "approval_id": "appr-r4-1",
+        "prompt_id": "appr-r4-1",
+        "execution_generation": 1,
         "tool": "shell",
         "command": "ls -la /tmp",
         "description": "list files",
@@ -1117,7 +1122,6 @@ def test_r4_status_waiting_for_approval_surfaces_approval_card_once():
             # identity gateway: the raw approval_id carries the exact-id
             # status-card recovery; the patch also keeps the capability
             # probe off the scripted urlopen wire
-            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: True),
         ],
     )
     result = harness["result"]
@@ -1174,7 +1178,6 @@ def test_r4_status_card_survives_without_capability_when_payload_carries_generat
             {"status": "waiting_for_approval", "approval": dict(approval_payload)},
         ],
         extra_patches=[
-            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: False),
         ],
     )
     result = harness["result"]
@@ -1234,7 +1237,6 @@ def test_r4_status_card_reads_the_canonical_pending_controls_projection():
         ],
         status_script=[projection, projection],
         extra_patches=[
-            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: False),
         ],
     )
     result = harness["result"]
@@ -1281,7 +1283,6 @@ def test_r8_republished_generation_is_relayed_again():
         ],
         status_script=[],
         extra_patches=[
-            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: False),
             (gc, "_settle_gateway_run_approval", fake_settle),
         ],
     )
@@ -1307,10 +1308,17 @@ def _generation_fenced_approval_frame(seq, prompt_id, generation, command):
     })
 
 
-def _approval_request_frame(seq, appr_id, command):
+def _identity(appr_id, generation):
+    """In-process approvals carry ``request_id``; fenced prompts ``prompt_id`` + generation."""
+    if generation is None:
+        return {"request_id": appr_id}
+    return {"prompt_id": appr_id, "execution_generation": generation}
+
+
+def _approval_request_frame(seq, appr_id, command, generation=None):
     return sse_frame(seq, {
         "event": "approval.request",
-        "approval_id": appr_id,
+        **_identity(appr_id, generation),
         "tool": "shell",
         "command": command,
         "description": f"run {command}",
@@ -1321,10 +1329,10 @@ def _approval_request_frame(seq, appr_id, command):
     })
 
 
-def _pending_approval_payload(appr_id, command):
+def _pending_approval_payload(appr_id, command, generation=None):
     """Durable-status shape of one parked approval."""
     return {
-        "approval_id": appr_id,
+        **_identity(appr_id, generation),
         "tool": "shell",
         "command": command,
         "description": f"run {command}",
@@ -1376,7 +1384,6 @@ def test_r6_status_approval_mirror_skipped_without_identity_fifo_replay_orders_a
              "approval": _pending_approval_payload("appr-B", "rm -rf /tmp/x")},
         ],
         extra_patches=[
-            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: False),
             (gc, "_settle_gateway_run_approval", fake_settle),
         ],
     )
@@ -1387,58 +1394,6 @@ def test_r6_status_approval_mirror_skipped_without_identity_fifo_replay_orders_a
                  if name == "approval"]
     assert approvals == ["appr-A", "appr-B"], (
         f"FIFO queue order must be preserved by the replay (A -> B), got {approvals}")
-    assert harness["status"].calls == 2, harness["trace"]
-
-
-def test_r6_identity_gateway_status_card_from_status_deduped_against_replay():
-    """Maintainer round-4 must-fix, identity-gateway variant: the exact-id
-    status-card recovery is KEPT. With ``approval_identity_v1`` advertised
-    and a raw approval id on the payload, the stalled probe surfaces B's
-    card from status, the replay then delivers A (surfaced) and B (deduped
-    by exact id) — each approval cards exactly once. (Not red by design:
-    pins the preserved behavior.)"""
-    import api.config as api_config
-
-    clock = FakeClock()
-
-    def fake_settle(*args, **kwargs):
-        return False, None, 1
-
-    harness = run_turn(
-        clock=clock,
-        urlopen_script=[
-            FakeSseResponse(keepalive() * 4, end="eof", clock=clock, advance_per_line=60.0),
-            FakeSseResponse(
-                _approval_request_frame(1, "appr-A", "echo first")
-                + _approval_request_frame(2, "appr-B", "rm -rf /tmp/x")
-                + keepalive() * 4,
-                end="eof", clock=clock, advance_per_line=60.0,
-            ),
-            FakeSseResponse(
-                sse_frame(0, {"event": "run.completed", "output": "done after approvals"}),
-                end="eof",
-            ),
-        ],
-        status_script=[
-            {"status": "waiting_for_approval",
-             "approval": _pending_approval_payload("appr-B", "rm -rf /tmp/x")},
-            {"status": "waiting_for_approval",
-             "approval": _pending_approval_payload("appr-B", "rm -rf /tmp/x")},
-        ],
-        extra_patches=[
-            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: True),
-            (gc, "_settle_gateway_run_approval", fake_settle),
-        ],
-    )
-    result = harness["result"]
-    assert result[0] == "done after approvals", (
-        f"run must finalize after the approval lane, got {result!r}")
-    approvals = [payload["approval_id"] for name, payload in harness["events"]
-                 if name == "approval"]
-    assert sorted(approvals) == ["appr-A", "appr-B"], (
-        f"each approval must card exactly once, got {approvals}")
-    assert approvals.count("appr-B") == 1, (
-        f"the status card must be deduped against the replay, got {approvals}")
     assert harness["status"].calls == 2, harness["trace"]
 
 
@@ -1464,7 +1419,7 @@ def test_r6_rejected_status_approval_payload_does_not_mask_replay():
             FakeSseResponse(keepalive() * 4, end="eof", clock=clock, advance_per_line=60.0),
             # reconnect: the replay delivers the FULL approval, then stalls
             FakeSseResponse(
-                _approval_request_frame(1, "appr-1", "ls -la /tmp")
+                _approval_request_frame(1, "appr-1", "ls -la /tmp", generation=1)
                 + keepalive() * 4,
                 end="eof", clock=clock, advance_per_line=60.0,
             ),
@@ -1475,13 +1430,12 @@ def test_r6_rejected_status_approval_payload_does_not_mask_replay():
         ],
         status_script=[
             {"status": "waiting_for_approval",
-             "approval": {"approval_id": "appr-1", "tool": "", "command": "",
-                          "description": ""}},
+             "approval": {"prompt_id": "appr-1", "execution_generation": 1, "tool": "",
+                          "command": "", "description": ""}},
             {"status": "waiting_for_approval",
-             "approval": _pending_approval_payload("appr-1", "ls -la /tmp")},
+             "approval": _pending_approval_payload("appr-1", "ls -la /tmp", generation=1)},
         ],
         extra_patches=[
-            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: True),
             (gc, "_settle_gateway_run_approval", fake_settle),
         ],
     )
@@ -2340,7 +2294,7 @@ def main():
         test_r4_byte_silent_stream_probes_status_within_watchdog_budget,
         test_r4_stop_during_byte_silence_cancels_within_budget,
         test_r4_status_waiting_for_approval_surfaces_approval_card_once,
-        test_r4_settle_flow_has_single_continue_branch,
+        test_live_and_resumed_turns_share_one_recovery_procedure,
         test_r4_cancel_marker_scan_stops_at_turn_boundary,
         test_r4_status_lane_cancel_persists_before_cancel_event,
         test_r5_run_completed_breaks_out_of_infinite_postterminal_keepalives,
@@ -2348,7 +2302,6 @@ def main():
         test_r5_socket_reset_after_terminal_frame_returns_immediately,
         test_r5_postterminal_delta_frame_ignored,
         test_r6_status_approval_mirror_skipped_without_identity_fifo_replay_orders_a_b,
-        test_r6_identity_gateway_status_card_from_status_deduped_against_replay,
         test_r6_rejected_status_approval_payload_does_not_mask_replay,
         test_r7_observer_on_seq_still_advances_reconnect_cursor,
         test_r7_observer_off_reconnect_cursor_unchanged,

@@ -33962,11 +33962,8 @@ def _relay_gateway_run_approval(
         from api.gateway_sessions import PREFIX, control as session_control
         canonical_session = run_id.startswith(PREFIX)
         # The identity decision was made once, when the gateway's own payload
-        # was interpreted: a mirror flagged v1 either carried an exact
-        # per-prompt id plus its execution generation, or came from a gateway
-        # advertising the capability. Re-asking /v1/capabilities here would
-        # re-open the very gap this fixes (the capability is not published by
-        # gateways that do fence prompts by generation).
+        # was interpreted: a mirror flagged v1 carried an exact per-prompt id
+        # plus its execution generation (a session-authority prompt).
         identity_v1 = bool(current_mirror.get(_GATEWAY_AGENT_IDENTITY_V1))
         execution_generation = current_mirror.get(_GATEWAY_EXECUTION_GENERATION)
         if type(execution_generation) is not int:

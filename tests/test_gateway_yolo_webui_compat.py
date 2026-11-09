@@ -215,7 +215,6 @@ def test_card_yolo_drains_all_run_backed_and_local_approvals(monkeypatch):
 
     monkeypatch.setattr(routes, "j", fake_j)
     monkeypatch.setattr("api.runner_client.HttpRunnerClient.respond_approval", fake_respond)
-    monkeypatch.setattr(config, "gateway_supports_approval_identity_v1", lambda *_a, **_k: True)
 
     try:
         routes._handle_approval_respond(
@@ -291,7 +290,6 @@ def test_stale_card_run_owner_cannot_rebind_to_current_run(monkeypatch, enable_y
     monkeypatch.setattr(routes, "j", fake_j)
     monkeypatch.setattr(routes, "get_session", lambda _sid: SimpleNamespace(active_stream_id=stream_id))
     monkeypatch.setattr("api.runner_client.HttpRunnerClient.respond_approval", fake_respond)
-    monkeypatch.setattr(config, "gateway_supports_approval_identity_v1", lambda *_a, **_k: True)
     monkeypatch.setenv("HERMES_WEBUI_CHAT_BACKEND", "gateway")
     gateway_chat._STREAM_RUN_IDS[stream_id] = current_run_id
 
@@ -520,9 +518,9 @@ def _run_with_approval_events(monkeypatch, *, yolo_enabled, auto_error=None):
 
     event_lines = [
         b'event: approval.request\n',
-        b'data: {"event":"approval.request","approval_id":"approval-1","tool":"terminal","command":"one"}\n',
+        b'data: {"event":"approval.request","request_id":"approval-1","tool":"terminal","command":"one"}\n',
         b'event: approval.request\n',
-        b'data: {"event":"approval.request","approval_id":"approval-2","tool":"terminal","command":"two"}\n',
+        b'data: {"event":"approval.request","request_id":"approval-2","tool":"terminal","command":"two"}\n',
         b'event: run.completed\n',
         b'data: {"event":"run.completed","output":"done"}\n',
     ]
@@ -546,7 +544,6 @@ def _run_with_approval_events(monkeypatch, *, yolo_enabled, auto_error=None):
     if yolo_enabled is not None:
         monkeypatch.setattr(gateway_chat, "_gateway_session_yolo_enabled", lambda _sid: yolo_enabled)
     monkeypatch.setattr(gateway_chat, "_auto_approve_gateway_run", fake_auto)
-    monkeypatch.setattr(config, "gateway_supports_approval_identity_v1", lambda *_a, **_k: True)
     monkeypatch.setattr("api.route_approvals.submit_gateway_pending_mirror", lambda _sid, data: (data, 1))
     monkeypatch.setattr("api.route_approvals.retire_gateway_pending_mirror", lambda *a, **k: None)
 
@@ -572,9 +569,11 @@ def test_enabled_gateway_yolo_auto_approves_every_later_prompt(monkeypatch):
     )
 
     assert final == "done"
+    # In-process approvals carry no execution generation, so each is answered
+    # as the head of the run's approval queue (empty id), in arrival order.
     assert approvals == [
-        ("http://gateway.local", "secret", "run-1", "approval-1"),
-        ("http://gateway.local", "secret", "run-1", "approval-2"),
+        ("http://gateway.local", "secret", "run-1", ""),
+        ("http://gateway.local", "secret", "run-1", ""),
     ]
     assert not [event for event in browser_events if event[0] == "approval"]
     run_body = json.loads(requests[0].data)
@@ -680,7 +679,6 @@ def test_card_yolo_uses_plain_runs_approval_and_rolls_back_on_failure(monkeypatc
     monkeypatch.setattr(routes, "j", fake_j)
     monkeypatch.setattr(routes, "get_session", lambda _sid: SimpleNamespace(active_stream_id=stream_id))
     monkeypatch.setattr("api.runner_client.HttpRunnerClient.respond_approval", fake_respond)
-    monkeypatch.setattr(config, "gateway_supports_approval_identity_v1", lambda *_a, **_k: True)
     monkeypatch.setenv("HERMES_WEBUI_CHAT_BACKEND", "gateway")
     gateway_chat._STREAM_RUN_IDS[stream_id] = run_id
 
@@ -742,7 +740,6 @@ def test_failed_relay_does_not_undo_concurrent_explicit_yolo_enable(monkeypatch)
     monkeypatch.setattr(routes, "j", fake_j)
     monkeypatch.setattr(routes, "get_session", lambda _sid: SimpleNamespace(active_stream_id=stream_id))
     monkeypatch.setattr("api.runner_client.HttpRunnerClient.respond_approval", fake_respond)
-    monkeypatch.setattr(config, "gateway_supports_approval_identity_v1", lambda *_a, **_k: True)
     monkeypatch.setenv("HERMES_WEBUI_CHAT_BACKEND", "gateway")
     gateway_chat._STREAM_RUN_IDS[stream_id] = run_id
     route_approvals.submit_gateway_pending_mirror(sid, {
@@ -813,7 +810,6 @@ def test_successful_relay_reports_concurrent_explicit_yolo_disable(monkeypatch):
     monkeypatch.setattr(routes, "j", fake_j)
     monkeypatch.setattr(routes, "get_session", lambda _sid: SimpleNamespace(active_stream_id=stream_id))
     monkeypatch.setattr("api.runner_client.HttpRunnerClient.respond_approval", fake_respond)
-    monkeypatch.setattr(config, "gateway_supports_approval_identity_v1", lambda *_a, **_k: True)
     monkeypatch.setenv("HERMES_WEBUI_CHAT_BACKEND", "gateway")
     gateway_chat._STREAM_RUN_IDS[stream_id] = run_id
     route_approvals.submit_gateway_pending_mirror(sid, {
@@ -880,7 +876,6 @@ def test_yolo_post_without_local_card_relays_run_backed_approval(monkeypatch):
     monkeypatch.setattr(routes, "_check_csrf", lambda _handler: True)
     monkeypatch.setattr(routes, "_handle_extension_sidecar_proxy", lambda *_a, **_k: False)
     monkeypatch.setattr("api.runner_client.HttpRunnerClient.respond_approval", fake_respond)
-    monkeypatch.setattr(config, "gateway_supports_approval_identity_v1", lambda *_a, **_k: True)
     monkeypatch.setenv("HERMES_WEBUI_CHAT_BACKEND", "gateway")
     route_approvals.submit_gateway_pending_mirror(sid, {
         "command": "touch /tmp/webui-yolo-test",
@@ -947,7 +942,6 @@ def test_yolo_post_preserves_mirror_while_owned_relay_fails(monkeypatch):
         lambda _sid, **_kwargs: SimpleNamespace(active_stream_id=None, profile=None),
     )
     monkeypatch.setattr("api.runner_client.HttpRunnerClient.respond_approval", fake_respond)
-    monkeypatch.setattr(config, "gateway_supports_approval_identity_v1", lambda *_a, **_k: True)
     monkeypatch.setenv("HERMES_WEBUI_CHAT_BACKEND", "gateway")
     route_approvals.submit_gateway_pending_mirror(sid, {
         "command": "touch /tmp/webui-yolo-test",
@@ -1554,7 +1548,6 @@ def test_yolo_post_first_relay_serializes_next_gateway_approval(monkeypatch):
     monkeypatch.setattr(routes, "gateway_yolo_handoff", lambda _sid: handoff_lock)
     monkeypatch.setattr(gateway_chat, "_auto_approve_gateway_run", fake_auto_approve)
     monkeypatch.setattr("api.runner_client.HttpRunnerClient.respond_approval", fake_respond)
-    monkeypatch.setattr(config, "gateway_supports_approval_identity_v1", lambda *_a, **_k: True)
     monkeypatch.setattr(routes, "j", fake_j)
     monkeypatch.setattr(routes, "read_body", lambda _handler: {"session_id": sid, "enabled": True})
     monkeypatch.setattr(routes, "_check_csrf", lambda _handler: True)
@@ -1666,7 +1659,6 @@ def test_card_yolo_first_relay_serializes_next_gateway_approval(monkeypatch, rel
     monkeypatch.setattr(routes, "get_session", lambda _sid: SimpleNamespace(active_stream_id=None))
     monkeypatch.setattr(gateway_chat, "_auto_approve_gateway_run", fake_auto_approve)
     monkeypatch.setattr("api.runner_client.HttpRunnerClient.respond_approval", fake_respond)
-    monkeypatch.setattr(config, "gateway_supports_approval_identity_v1", lambda *_a, **_k: True)
     monkeypatch.setattr(routes, "j", fake_j)
 
     try:

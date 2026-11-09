@@ -428,6 +428,16 @@ the next level only through its output type:
   (`STREAM_PARTIAL_TEXT`, `STREAM_REASONING_TEXT`, `STREAM_LIVE_TOOL_CALLS`).
 - Control events (approvals, terminal run events, replay truncation) are not
   projected: their side effects are orchestration and stay in `gateway_chat.py`.
+- Layer 2 decodes only the shapes the current Hermes Agent API server emits
+  (`gateway/platforms/api_server_runs.py`, `api_server_openai_routes.py`,
+  `gateway/run_turn_progress.py`): Runs API `_run_event` envelopes named by
+  `event`; Chat Completions chunks (`delta.content`, `delta.reasoning_content`,
+  finish usage/`error`) plus the named `hermes.tool.progress` and
+  `approval.request` events; session-protocol `message.delta`,
+  `reasoning.delta`/`thinking.delta` and `tool.start`/`tool.complete`. Approval
+  prompts are identified by `request_id` (in-process) or `prompt_id` +
+  `execution_generation` (session authority); a prompt without an id is not
+  surfaced.
 - Invariant: every snapshot update comes from the same projection that emits
   the journaled WebUI event, so the snapshot is the fold of the journal.
   `TurnCheckpoint.restore()` rebuilds it after a WebUI restart by folding

@@ -76,15 +76,15 @@ CANONICAL = {
     "choices": ["once", "session", "always", "deny"],
 }
 LEGACY = {
-    # A legacy Gateway: older approval_id name, no execution generation.
+    # An in-process Gateway approval: request_id, no execution generation.
     "event": "approval.request",
     "run_id": RUN_ID,
-    "approval_id": "appr-stop-retires-legacy",
+    "request_id": "appr-stop-retires-legacy",
     "tool": "terminal",
     "command": "rm -rf /tmp/stop-retires",
     "description": "delete temp dir",
 }
-GATEWAYS = pytest.mark.parametrize("payload", [CANONICAL, LEGACY], ids=["fenced", "legacy"])
+GATEWAYS = pytest.mark.parametrize("payload", [CANONICAL, LEGACY], ids=["fenced", "in_process"])
 
 
 # ---------------------------------------------------------------------------
@@ -556,7 +556,7 @@ def test_card_parsed_while_stop_lands_is_not_published(gateway_env, monkeypatch,
             "a card published after the stop stays actionable for a stopped run"
         )
         card = {
-            "approval_id": payload.get("request_id") or payload.get("approval_id"),
+            "approval_id": payload["request_id"],
             "run_id": RUN_ID,
             "_gateway_mirror_token": "any",
         }
@@ -610,7 +610,7 @@ def test_card_cannot_be_published_after_stop_returned(gateway_env, monkeypatch, 
             "the worker published a card after Stop had returned"
         )
         card = {
-            "approval_id": payload.get("request_id") or payload.get("approval_id"),
+            "approval_id": payload["request_id"],
             "run_id": RUN_ID,
             "_gateway_mirror_token": "any",
         }

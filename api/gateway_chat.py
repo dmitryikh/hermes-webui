@@ -46,7 +46,7 @@ from api.gateway_events import (
     UsageReport,
     decode_chat_completion_frame,
     decode_runs_frame,
-    nonzero_usage,
+    runs_usage,
 )
 from api.gateway_projection import GatewayEventProjector, LiveTurnSnapshot, TurnCheckpoint
 from api import gateway_sse
@@ -629,19 +629,13 @@ def _gateway_http_error_event(exc: urllib.error.HTTPError, err_body: str | None 
 
 
 def _gateway_prompt_identity(payload) -> str:
-    """The exact per-prompt id a gateway published, across payload generations.
+    """The exact per-prompt id the Gateway published.
 
-    ``request_id`` (session bridge) and ``prompt_id`` (pending-controls
-    projection) are the canonical names; ``approval_id`` / ``id`` are the
-    older shapes kept for gateways that still send them.
+    In-process approvals carry ``request_id`` (``status["approval"]`` and the
+    ``approval.request`` event); session-authority prompts carry ``prompt_id``
+    (``pending_controls`` and their control events).
     """
-    return str(
-        payload.get("request_id")
-        or payload.get("prompt_id")
-        or payload.get("approval_id")
-        or payload.get("id")
-        or ""
-    ).strip()
+    return str(payload.get("request_id") or payload.get("prompt_id") or "").strip()
 
 
 def _gateway_runs_approval_event(payload: dict) -> dict | None:
@@ -655,18 +649,15 @@ def _gateway_runs_approval_event(payload: dict) -> dict | None:
     pattern_key = str(payload.get("pattern_key") or "").strip()
     args = payload.get("args") if isinstance(payload.get("args"), (list, dict)) else []
     run_id = str(payload.get("run_id") or "").strip()
-    raw_approval_id = _gateway_prompt_identity(payload)
-    # The canonical Runs API approval payload identifies the prompt as
-    # ``request_id`` (session bridge) or ``prompt_id`` (pending-controls
-    # projection) and fences it with an integer ``execution_generation``. Keep
-    # both: without them the client can only guess a local id and has nothing
-    # the generation-fenced respond endpoint will accept.
+    # Every Gateway prompt carries its id; a session-authority prompt is also
+    # fenced by an integer ``execution_generation``. A prompt without an id
+    # cannot be answered exactly, so it is not surfaced (fail closed).
+    approval_id = _gateway_prompt_identity(payload)
+    if not approval_id:
+        return None
     execution_generation = payload.get("execution_generation")
     if type(execution_generation) is not int:
         execution_generation = None
-    approval_id = raw_approval_id
-    if not approval_id:
-        approval_id = uuid.uuid4().hex
     risk = str(payload.get("risk_level") or "high").strip()
     choices = payload.get("choices") if isinstance(payload.get("choices"), list) else []
     allow_permanent = payload.get("allow_permanent")
@@ -684,7 +675,6 @@ def _gateway_runs_approval_event(payload: dict) -> dict | None:
         "risk_level": risk,
         "run_id": run_id,
         "approval_id": approval_id,
-        "_gateway_raw_approval_id_present": bool(raw_approval_id),
         "_gateway_execution_generation": execution_generation,
         "choices": choices,
         "allow_permanent": bool(allow_permanent),
@@ -699,7 +689,7 @@ def _gateway_approval_key(payload) -> str:
     old generation is refused by the gateway. Keying on the id alone deduped that
     replay away and left the mirror pointing at a dead generation.
     """
-    identity = _gateway_prompt_identity(payload) or str(payload.get("timestamp") or "")
+    identity = _gateway_prompt_identity(payload)
     generation = payload.get("execution_generation")
     if identity and type(generation) is int:
         return f"{identity}#{generation}"
@@ -726,34 +716,16 @@ def _gateway_status_approval(status: dict) -> dict | None:
     return None
 
 
-def _gateway_approval_identity_v1(approval_data: dict, base_url: str, api_key: str) -> bool:
-    """Decide once, at card-creation time, whether this card carries a canonical identity.
+def _gateway_approval_identity_v1(approval_data: dict) -> bool:
+    """Decide once, at card-creation time, whether this card is answered by exact identity.
 
-    Shared by every card origin — the Runs API relay and the default
-    ``/v1/chat/completions`` stream — so both publish the same creation-time
-    decision and ``/api/approval/respond`` never has to re-derive it: it
-    cannot, because the advertised capability is not published by gateways
-    that fence prompts by generation.
-
-    Exact-id answering needs a trustworthy per-prompt identity. A gateway that
-    published an ``execution_generation`` for this prompt proves it can fence
-    the answer to that exact prompt (canonical Runs API contract), so the
-    generation itself is the authority; the advertised capability remains the
-    fallback for gateways that only promise it via ``/v1/capabilities``.
-
-    A locally generated fallback id (``_gateway_raw_approval_id_present`` is
-    False) is never canonical: the gateway did not publish that id, so
-    answering with it is a guaranteed 400. It must not be promoted into one
-    here — the legacy body shape is the only honest answer for such a card.
+    Shared by every card origin (Runs API relay, ``/v1/chat/completions``
+    stream, durable status), so ``/api/approval/respond`` never re-derives it.
+    A session-authority prompt is fenced by its ``execution_generation`` and is
+    answered with ``{request_id, execution_generation, choice}``; an in-process
+    approval has no generation and is answered by the in-process run handler.
     """
-    from api.config import gateway_supports_approval_identity_v1
-
-    approval_data = approval_data or {}
-    if not bool(approval_data.get("_gateway_raw_approval_id_present")):
-        return False
-    if approval_data.get("_gateway_execution_generation") is not None:
-        return True
-    return bool(gateway_supports_approval_identity_v1(base_url, api_key))
+    return (approval_data or {}).get("_gateway_execution_generation") is not None
 
 
 def _relay_gateway_run_approval(session_id, run_id, payload, base_url, api_key, *, put_gateway_event) -> bool:
@@ -767,9 +739,7 @@ def _relay_gateway_run_approval(session_id, run_id, payload, base_url, api_key, 
     if not approval_data:
         return False
     approval_data["run_id"] = run_id
-    approval_data["_gateway_agent_identity_v1"] = _gateway_approval_identity_v1(
-        approval_data, base_url, api_key
-    )
+    approval_data["_gateway_agent_identity_v1"] = _gateway_approval_identity_v1(approval_data)
     auto_approved, head, total = _settle_gateway_run_approval(
         session_id,
         approval_data,
@@ -804,9 +774,7 @@ def _relay_chat_completion_approval(
     # generation-fenced gateway rejects the relayed answer with 400
     # invalid_params and the card never settles. Skipping it here silently
     # downgraded every default-stream card to the legacy body.
-    approval_data["_gateway_agent_identity_v1"] = _gateway_approval_identity_v1(
-        approval_data, base_url, api_key
-    )
+    approval_data["_gateway_agent_identity_v1"] = _gateway_approval_identity_v1(approval_data)
     try:
         head, total = _submit_stream_approval_mirror(session_id, approval_data, cancel_event)
         approval_data = {**(head or approval_data), "pending_count": total}
@@ -1039,7 +1007,7 @@ def _admit_gateway_run(url_runs, headers, run_body, stream_id) -> str:
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
         run_data = json.loads(resp.read(65536))
-    run_id = str(run_data.get("run_id") or run_data.get("id") or "").strip()
+    run_id = str(run_data.get("run_id") or "").strip()
     if not run_id:
         raise ValueError(f"Gateway runs API returned no run_id: {run_data!r}")
     return run_id
@@ -1644,23 +1612,15 @@ class _GatewayRunFollower:
 
         The status carries only one pending approval. While the events replay
         can still deliver the queue in order, surfacing it ahead of the replay
-        would invert FIFO, so a live follower does so only for a prompt with an
-        exact identity (a raw id fenced by a generation or the advertised
-        capability). A resumed follower always does: the previous process's
+        would invert FIFO, so a live follower does so only for a prompt fenced
+        by its execution generation. A resumed follower always does: the previous process's
         cards are gone and the replay may never re-send them.
         """
         approval = _gateway_status_approval(status)
         if str(status.get("status") or "").strip().lower() != "waiting_for_approval" or not isinstance(approval, dict):
             return
-        if not self.resumed:
-            from api.config import gateway_supports_approval_identity_v1
-
-            exact = _gateway_prompt_identity(approval) and (
-                type(approval.get("execution_generation")) is int
-                or gateway_supports_approval_identity_v1(self.base_url, self.api_key)
-            )
-            if not exact:
-                return
+        if not self.resumed and type(approval.get("execution_generation")) is not int:
+            return
         approval_key = _gateway_approval_key(approval)
         if approval_key and approval_key not in self.surfaced_approval_ids:
             relayed = _relay_gateway_run_approval(
@@ -1693,7 +1653,7 @@ class _GatewayRunFollower:
         output = str(status.get("output") or "") or self.checkpoint.text or LiveTurnSnapshot.partial_text(self.stream_id)
         if output:
             self.checkpoint.snapshot.adopt_text(output)
-        self.usage.update(nonzero_usage(status))
+        self.usage.update(runs_usage(status))
         return self.checkpoint.text, self.usage
 
     def pace(self, outcome: str) -> None:

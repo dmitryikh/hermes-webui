@@ -9,14 +9,17 @@ orchestration in ``api.gateway_chat``.
 
 The Gateway speaks three wire dialects, one decoder each:
 
-* ``decode_runs_frame`` — ``GET /v1/runs/{id}/events`` (Runs API). Hermes
-  event names travel in the JSON ``event``/``type`` field; untyped frames are
-  OpenAI-compatible chunks.
-* ``decode_chat_completion_frame`` — ``POST /v1/chat/completions`` streaming.
-  OpenAI chunks, with Hermes extensions announced by the SSE ``event:`` field
-  (``hermes.tool.progress``, ``reasoning.available``) and approval requests.
+* ``decode_runs_frame`` — ``GET /v1/runs/{id}/events`` (Runs API): every
+  payload is a ``_run_event`` envelope named by its ``event`` field.
+* ``decode_chat_completion_frame`` — ``POST /v1/chat/completions`` streaming:
+  ``chat.completion.chunk`` objects (text, ``reasoning_content``, finish
+  usage/error) plus the named Hermes events ``hermes.tool.progress`` and
+  ``approval.request``.
 * ``decode_session_event`` — the canonical session protocol
   (``api.gateway_sessions``) whose frames arrive already parsed over JSON-RPC.
+
+Only the shapes the current Hermes Agent Gateway emits are accepted; older
+field names and event aliases are not decoded.
 """
 from __future__ import annotations
 
@@ -142,117 +145,35 @@ TERMINAL_RUN_EVENTS = (RunCompleted, RunFailed, RunCancelled)
 
 # ---------------------------------------------------------------------------
 # Payload field extraction
+#
+# Each dialect is decoded exactly as Hermes Agent's API server emits it
+# (gateway/platforms/api_server_runs.py, api_server_openai_routes.py,
+# gateway/run_turn_progress.py); shapes no current Gateway sends are not
+# accepted.
 # ---------------------------------------------------------------------------
 
-def chunk_text_delta(payload: dict) -> str:
-    """Extract assistant text from an OpenAI-compatible streaming chunk."""
-    try:
-        choices = payload.get("choices") or []
-        if not choices:
-            return ""
-        choice = choices[0] or {}
-        delta = choice.get("delta") or {}
-        content = delta.get("content")
-        if isinstance(content, str):
-            return content
-        message = choice.get("message") or {}
-        content = message.get("content")
-        return content if isinstance(content, str) else ""
-    except Exception:
-        return ""
-
-
-def chunk_reasoning_delta(payload: dict) -> str:
-    """Extract reasoning text from OpenAI-compatible streaming chunks."""
-    try:
-        choices = payload.get("choices") or []
-        if not choices:
-            return ""
-        choice = choices[0] or {}
-        delta = choice.get("delta") or {}
-        reasoning = delta.get("reasoning_content")
-        if isinstance(reasoning, str) and reasoning.strip():
-            return reasoning
-        message = choice.get("message") or {}
-        reasoning = message.get("reasoning_content")
-        return reasoning if isinstance(reasoning, str) and reasoning.strip() else ""
-    except Exception:
-        return ""
-
-
-def payload_usage(payload: dict) -> dict:
-    """Normalize OpenAI/Hermes usage names to WebUI usage keys."""
-    usage = payload.get("usage") if isinstance(payload, dict) else None
+def _usage(payload: dict, input_key: str, output_key: str) -> dict:
+    usage = payload.get("usage")
     if not isinstance(usage, dict):
         return {}
-    return {
-        "input_tokens": int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0),
-        "output_tokens": int(usage.get("completion_tokens") or usage.get("output_tokens") or 0),
-        "estimated_cost": usage.get("estimated_cost") or usage.get("estimated_cost_usd") or 0,
-    }
+    values = {"input_tokens": usage.get(input_key), "output_tokens": usage.get(output_key)}
+    return {key: int(value) for key, value in values.items() if isinstance(value, int) and value}
 
 
-def nonzero_usage(payload: dict) -> dict:
-    """``payload_usage`` without zero/empty fields (safe to ``dict.update`` into a total)."""
-    return {k: v for k, v in payload_usage(payload).items() if v}
+def runs_usage(payload: dict) -> dict:
+    """Non-zero usage of a Runs API terminal event or run status (``input_tokens``/``output_tokens``)."""
+    return _usage(payload, "input_tokens", "output_tokens")
 
 
-def reasoning_text(payload: dict) -> str:
-    """Reasoning text of a ``reasoning.available`` / ``_thinking`` payload."""
-    if not isinstance(payload, dict):
-        return ""
-    for key in ("text", "preview", "delta", "content"):
-        value = payload.get(key)
-        if isinstance(value, str) and value.strip():
-            return value
-    return ""
+def _chat_usage(payload: dict) -> dict:
+    """Non-zero usage of a Chat Completions finish chunk (``prompt_tokens``/``completion_tokens``)."""
+    return _usage(payload, "prompt_tokens", "completion_tokens")
 
 
-def decode_tool_progress(payload: dict) -> ToolProgress | ReasoningDelta | None:
-    """Decode a Hermes tool-progress / reasoning payload.
-
-    ``_thinking`` progress and ``reasoning.available`` are reasoning; other
-    underscore-prefixed tools are internal and dropped.
-    """
-    if not isinstance(payload, dict):
-        return None
-    event_type = str(payload.get("event") or "").strip().lower()
-    if event_type == "reasoning.available":
-        text = reasoning_text(payload)
-        return ReasoningDelta(text) if text else None
-    name = str(payload.get("tool") or payload.get("name") or payload.get("function_name") or "").strip()
-    if not name:
-        return None
-    if name == "_thinking":
-        text = reasoning_text(payload)
-        return ReasoningDelta(text) if text else None
-    if name.startswith("_"):
-        return None
-    status = str(payload.get("status") or "running").strip().lower()
-    tid = payload.get("toolCallId") or payload.get("tool_call_id") or payload.get("id")
-    return ToolProgress(
-        completed=event_type == "tool.completed" or status in {"completed", "complete", "success", "error", "failed"},
-        name=name,
-        preview=payload.get("label") or payload.get("preview"),
-        args=bound_run_journal_snapshot_args(payload.get("args")) if isinstance(payload.get("args"), dict) else {},
-        is_error=bool(payload.get("error")) or status in {"error", "failed"},
-        tid=str(tid) if tid else None,
-    )
-
-
-def _chunk_events(payload: dict) -> list[GatewayEvent]:
-    """Reasoning, text and usage carried by one OpenAI-compatible chunk, in relay order."""
-    events: list[GatewayEvent] = []
-    reasoning = chunk_reasoning_delta(payload)
-    if reasoning:
-        events.append(ReasoningDelta(reasoning))
-    text = chunk_text_delta(payload)
-    if text:
-        events.append(TextDelta(text))
-    usage = nonzero_usage(payload)
-    if usage:
-        events.append(UsageReport(usage))
-    return events
+def _public_tool(name) -> str:
+    """The tool name, or "" for a missing or internal (``_``-prefixed) tool."""
+    name = name.strip() if isinstance(name, str) else ""
+    return "" if name.startswith("_") else name
 
 
 def _json_object(data: str) -> dict | None:
@@ -263,21 +184,58 @@ def _json_object(data: str) -> dict | None:
     return payload if isinstance(payload, dict) else None
 
 
-def payload_event_name(payload: dict, sse_event: str = "message") -> str:
-    """The Hermes event name: JSON ``event``/``type`` field, else the SSE event name."""
-    return str(payload.get("event") or payload.get("type") or sse_event).strip() or "message"
-
-
 # ---------------------------------------------------------------------------
 # Dialect decoders
 # ---------------------------------------------------------------------------
 
-_RUNS_TOOL_EVENTS = frozenset({"tool.started", "tool.completed", "reasoning.available"})
-APPROVAL_EVENT_NAMES = frozenset({"hermes.approval.request", "approval.request"})
+def _decode_runs_event(name: str, payload: dict) -> GatewayEvent | None:
+    if name == "message.delta":
+        delta = payload.get("delta")
+        return TextDelta(delta) if isinstance(delta, str) and delta else None
+    if name == "message.interim":
+        text = payload.get("text")
+        if isinstance(text, str) and text.strip():
+            return InterimMessage(text.strip(), payload.get("already_streamed") is True)
+        return None
+    if name == "reasoning.available":
+        text = payload.get("text")
+        return ReasoningDelta(text) if isinstance(text, str) and text.strip() else None
+    if name in ("tool.started", "tool.completed"):
+        tool = _public_tool(payload.get("tool"))
+        if not tool:
+            return None
+        tid = payload.get("tool_call_id")
+        return ToolProgress(
+            completed=name == "tool.completed",
+            name=tool,
+            preview=payload.get("preview"),
+            is_error=payload.get("error") is True,
+            tid=tid if isinstance(tid, str) and tid else None,
+        )
+    if name == "approval.request":
+        return ApprovalRequest(payload)
+    if name == "run.completed":
+        return RunCompleted(
+            output=str(payload.get("output") or ""),
+            usage=runs_usage(payload),
+            error=str(payload["error"]) if payload.get("error") else "",
+            payload=payload,
+        )
+    if name == "run.failed":
+        return RunFailed(str(payload.get("error") or "Gateway run failed"), payload)
+    if name in ("run.cancelled", "run.interrupted"):
+        return RunCancelled(payload)
+    if name == "replay.truncated":
+        return ReplayTruncated()
+    return None  # lifecycle/subagent/control events the WebUI does not render
 
 
 def decode_runs_frame(frame: SseFrame) -> GatewayFrame | None:
-    """Decode one ``/v1/runs/{id}/events`` frame; ``None`` when it carries no JSON object."""
+    """Decode one ``/v1/runs/{id}/events`` frame; ``None`` when it carries no JSON object.
+
+    Every Runs API payload is a ``_run_event`` envelope: the event name in
+    ``event`` and the replay cursor in ``seq``.
+    """
     if not frame.has_payload:
         return None
     if frame.is_done:
@@ -286,42 +244,38 @@ def decode_runs_frame(frame: SseFrame) -> GatewayFrame | None:
     if payload is None:
         return None
     seq = payload.get("seq") if isinstance(payload.get("seq"), int) else None
-    name = payload_event_name(payload, frame.event)
+    event = _decode_runs_event(str(payload.get("event") or ""), payload)
+    return GatewayFrame(seq=seq, events=(event,) if event is not None else ())
+
+
+def _decode_chat_chunk(payload: dict) -> list[GatewayEvent]:
+    """Reasoning, text, usage and failure of one ``chat.completion.chunk``, in relay order."""
     events: list[GatewayEvent] = []
-    if name == "replay.truncated":
-        events.append(ReplayTruncated())
-    elif name == "approval.request":
-        events.append(ApprovalRequest(payload))
-    elif name in _RUNS_TOOL_EVENTS:
-        decoded = decode_tool_progress(payload)
-        if decoded is not None:
-            events.append(decoded)
-    elif name == "message.interim":
-        text = payload.get("text")
-        if isinstance(text, str) and text.strip():
-            events.append(InterimMessage(text.strip(), payload.get("already_streamed") is True))
-    elif name == "message.delta":
-        delta = str(payload.get("delta") or "")
-        if delta:
-            events.append(TextDelta(delta))
-    elif name == "run.completed":
-        events.append(RunCompleted(
-            output=str(payload.get("output") or ""),
-            usage=nonzero_usage(payload),
-            error=str(payload["error"]) if payload.get("error") else "",
-            payload=payload,
-        ))
-    elif name == "run.failed":
-        events.append(RunFailed(str(payload.get("error") or "Gateway run failed"), payload))
-    elif name == "run.cancelled":
-        events.append(RunCancelled(payload))
-    else:
-        events.extend(_chunk_events(payload))
-    return GatewayFrame(seq=seq, events=tuple(events))
+    choices = payload.get("choices")
+    choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+    delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+    reasoning = delta.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning.strip():
+        events.append(ReasoningDelta(reasoning))
+    content = delta.get("content")
+    if isinstance(content, str) and content:
+        events.append(TextDelta(content))
+    usage = _chat_usage(payload)
+    if usage:
+        events.append(UsageReport(usage))
+    if choice.get("finish_reason") == "error":
+        error = payload.get("error")
+        message = error.get("message") if isinstance(error, dict) else None
+        events.append(ChunkError(str(message or "Gateway run failed")))
+    return events
 
 
 def decode_chat_completion_frame(frame: SseFrame) -> GatewayFrame | None:
-    """Decode one ``/v1/chat/completions`` streaming frame; ``None`` when it carries no JSON object."""
+    """Decode one ``/v1/chat/completions`` streaming frame; ``None`` when it carries no JSON object.
+
+    Unnamed frames are ``chat.completion.chunk`` objects; Hermes extensions are
+    named SSE events: ``hermes.tool.progress`` and ``approval.request``.
+    """
     if not frame.has_payload:
         return None
     if frame.is_done:
@@ -329,22 +283,21 @@ def decode_chat_completion_frame(frame: SseFrame) -> GatewayFrame | None:
     payload = _json_object(frame.data)
     if payload is None:
         return None
-    events: list[GatewayEvent] = []
-    if payload_event_name(payload, frame.event) in APPROVAL_EVENT_NAMES:
-        events.append(ApprovalRequest(payload))
-    elif frame.event == "hermes.tool.progress":
-        decoded = decode_tool_progress(payload)
-        if decoded is not None:
-            events.append(decoded)
-    elif frame.event == "reasoning.available":
-        text = reasoning_text(payload)
-        if text:
-            events.append(ReasoningDelta(text))
-    else:
-        if payload.get("error"):
-            events.append(ChunkError(str(payload["error"])))
-        events.extend(_chunk_events(payload))
-    return GatewayFrame(events=tuple(events))
+    if frame.event == "message":
+        return GatewayFrame(events=tuple(_decode_chat_chunk(payload)))
+    if frame.event == "approval.request":
+        return GatewayFrame(events=(ApprovalRequest(payload),))
+    if frame.event == "hermes.tool.progress":
+        tool = _public_tool(payload.get("tool"))
+        tid = payload.get("toolCallId")
+        if tool:
+            return GatewayFrame(events=(ToolProgress(
+                completed=payload.get("status") == "completed",
+                name=tool,
+                preview=payload.get("label"),
+                tid=tid if isinstance(tid, str) and tid else None,
+            ),))
+    return GatewayFrame()  # other named events (e.g. ``hermes.status``) are not rendered
 
 
 def decode_session_event(kind: str, payload: dict) -> GatewayEvent | None:
@@ -354,20 +307,19 @@ def decode_session_event(kind: str, payload: dict) -> GatewayEvent | None:
     session transport, which owns their request/response lifecycle.
     """
     payload = payload if isinstance(payload, dict) else {}
-    if kind == "message.delta":
-        text = payload.get("text") or payload.get("delta") or ""
-        return TextDelta(text) if isinstance(text, str) and text else None
-    if kind in {"reasoning.delta", "thinking.delta"}:
-        text = payload.get("text") or payload.get("delta") or ""
-        return ReasoningDelta(text) if isinstance(text, str) and text else None
-    if kind in {"tool.start", "tool.complete"}:
-        tid = payload.get("tool_call_id") or payload.get("id")
+    if kind in ("message.delta", "reasoning.delta", "thinking.delta"):
+        text = payload.get("text")  # ``None`` is a viewer-only segment boundary
+        if not isinstance(text, str) or not text:
+            return None
+        return TextDelta(text) if kind == "message.delta" else ReasoningDelta(text)
+    if kind in ("tool.start", "tool.complete"):
+        tid = payload.get("tool_call_id")
         args = payload.get("args")
         return ToolProgress(
             completed=kind == "tool.complete",
-            name=str(payload.get("name") or payload.get("tool") or ""),
+            name=str(payload.get("name") or ""),
             args=bound_run_journal_snapshot_args(args) if isinstance(args, dict) else {},
-            is_error=bool(payload.get("is_error", payload.get("error", False))),
-            tid=str(tid) if tid else None,
+            is_error=payload.get("is_error") is True,
+            tid=tid if isinstance(tid, str) and tid else None,
         )
     return None

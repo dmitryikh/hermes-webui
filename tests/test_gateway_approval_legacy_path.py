@@ -74,33 +74,22 @@ def _decode_lines(*lines):
     return [frame for frame in frames if frame is not None]
 
 
-@pytest.mark.parametrize("name", ["approval.request", "hermes.approval.request"])
-def test_legacy_decoder_recognizes_approval_from_sse_event_name(name):
-    """Both approval event names announced by the SSE ``event:`` field are approvals."""
-    payload = {"command": "rm -rf /tmp/x", "approval_id": "a1"}
-    (frame,) = _decode_lines(f"event: {name}".encode(), f"data: {json.dumps(payload)}".encode())
+def test_chat_decoder_recognizes_the_named_approval_event():
+    """The Gateway announces a chat-stream approval as a named ``approval.request`` SSE event."""
+    payload = {"event": "approval.request", "run_id": "chatcmpl-1", "request_id": "a1", "command": "rm -rf /tmp/x"}
+    (frame,) = _decode_lines(b"event: approval.request", f"data: {json.dumps(payload)}".encode())
     assert frame.events == (ApprovalRequest(payload),)
 
 
-@pytest.mark.parametrize("field", ["event", "type"])
-@pytest.mark.parametrize("name", ["approval.request", "hermes.approval.request"])
-def test_legacy_decoder_derives_approval_from_payload(field, name):
-    """The JSON ``event``/``type`` field names an approval without an SSE ``event:`` line."""
-    payload = {field: name, "command": "rm -rf /tmp/x"}
-    (frame,) = _decode_lines(f"data: {json.dumps(payload)}".encode())
-    assert frame.events == (ApprovalRequest(payload),)
-
-
-def test_legacy_decoder_approval_event_name_does_not_bleed():
+def test_chat_decoder_approval_event_name_does_not_bleed():
     """The SSE event name resets after the approval frame, so it cannot bleed into the next payload."""
-    tool_like = {"tool": "terminal", "status": "running"}
     frames = _decode_lines(
-        b"event: hermes.approval.request",
-        b'data: {"command": "rm -rf /tmp/x"}',
-        f"data: {json.dumps(tool_like)}".encode(),
+        b"event: approval.request",
+        b'data: {"request_id": "a1", "command": "rm -rf /tmp/x"}',
+        b'data: {"choices": [{"delta": {"content": "next"}}]}',
     )
     assert isinstance(frames[0].events[0], ApprovalRequest)
-    assert frames[1].events == ()
+    assert not any(isinstance(event, ApprovalRequest) for event in frames[1].events)
 
 
 def test_legacy_loop_dispatches_approvals_to_the_card_relay():
@@ -122,11 +111,10 @@ def test_legacy_card_relay_maps_mirrors_and_emits_the_approval():
         mirrored.append((session_id, approval_data["approval_id"]))
         return {**approval_data, "mirrored": True}, 2
 
-    with patch.object(gateway_chat, "_submit_stream_approval_mirror", side_effect=mirror), \
-            patch("api.config.gateway_supports_approval_identity_v1", return_value=False):
+    with patch.object(gateway_chat, "_submit_stream_approval_mirror", side_effect=mirror):
         relayed = gateway_chat._relay_chat_completion_approval(
             "sid-legacy", "stream-legacy",
-            {"command": "rm -rf /tmp/x", "approval_id": "a1", "run_id": "run-legacy"},
+            {"command": "rm -rf /tmp/x", "request_id": "a1", "run_id": "run-legacy"},
             "http://gateway.test", "",
             cancel_event=threading.Event(), put_gateway_event=lambda e, d: events.append((e, d)),
         )
@@ -153,7 +141,7 @@ def test_approval_event_mapping_complete_payload():
         "description": "Dangerous command approval",
         "pattern_key": "dangerous_command",
         "pattern_keys": ["dangerous_command"],
-        "approval_id": "appr-leg-1",
+        "request_id": "appr-leg-1",
         "choices": ["once", "session", "always", "deny"],
     })
     assert result is not None
@@ -199,7 +187,7 @@ def test_legacy_sse_loop_relays_approval_event():
         "description": "Delete temporary files",
         "pattern_key": "dangerous_command",
         "pattern_keys": ["dangerous_command"],
-        "approval_id": "appr-legacy-1",
+        "request_id": "appr-legacy-1",
         "choices": ["once", "session", "always", "deny"],
     })
     sse_body = (
@@ -299,7 +287,7 @@ def test_legacy_approval_records_run_id_for_response_relay():
         "description": "Delete temporary files",
         "pattern_key": "dangerous_command",
         "pattern_keys": ["dangerous_command"],
-        "approval_id": "appr-legacy-runid",
+        "request_id": "appr-legacy-runid",
         "run_id": "run-legacy-1",
         "choices": ["once", "session", "always", "deny"],
     })
@@ -417,7 +405,7 @@ def test_legacy_teardown_clears_stale_gateway_mirror_and_notifies_empty_state():
         "description": "Delete temporary files",
         "pattern_key": "dangerous_command",
         "pattern_keys": ["dangerous_command"],
-        "approval_id": "appr-legacy-teardown-stale",
+        "request_id": "appr-legacy-teardown-stale",
         "choices": ["once", "session", "always", "deny"],
         "run_id": "run-legacy-teardown-stale",
     }
@@ -496,7 +484,7 @@ def test_legacy_teardown_retires_live_gateway_head_mirror():
         "description": "Delete temporary files",
         "pattern_key": "dangerous_command",
         "pattern_keys": ["dangerous_command"],
-        "approval_id": "appr-legacy-teardown-live",
+        "request_id": "appr-legacy-teardown-live",
         "choices": ["once", "session", "always", "deny"],
         "run_id": "run-legacy-teardown-live",
     }
@@ -576,7 +564,7 @@ def test_legacy_teardown_preserves_local_pending_entry():
         "description": "Delete temporary files",
         "pattern_key": "dangerous_command",
         "pattern_keys": ["dangerous_command"],
-        "approval_id": "appr-legacy-teardown-local",
+        "request_id": "appr-legacy-teardown-local",
         "choices": ["once", "session", "always", "deny"],
         "run_id": "run-legacy-teardown-local",
     }
@@ -807,7 +795,7 @@ def test_legacy_approval_without_run_id_retires_locally():
         "description": "Delete temporary files",
         "pattern_key": "dangerous_command",
         "pattern_keys": ["dangerous_command"],
-        "approval_id": "appr-legacy-no-run",
+        "request_id": "appr-legacy-no-run",
         "choices": ["once", "session", "always", "deny"],
     })
     sse_body = (
@@ -989,8 +977,7 @@ def test_route_deny_settles_exact_non_head_run_producer():
         assert mirror is not None, "the non-head approval must be mirrored before it is answered"
 
         with patch("api.routes.j", new=fake_j), \
-             patch("api.runner_client.HttpRunnerClient.respond_approval", new=fake_respond), \
-             patch("api.config.gateway_supports_approval_identity_v1", return_value=True):
+             patch("api.runner_client.HttpRunnerClient.respond_approval", new=fake_respond):
             r._handle_approval_respond(
                 object(),
                 {

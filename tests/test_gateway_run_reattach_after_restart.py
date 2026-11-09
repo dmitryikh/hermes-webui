@@ -286,14 +286,14 @@ def test_reattach_surfaces_pending_approval_once(isolated_sessions, monkeypatch)
         calls["n"] += 1
         if calls["n"] < 4:
             return {"run_id": run_id, "status": "waiting_for_approval", "approval": {
-                "event": "approval.request", "approval_id": "appr-1", "command": "rm -rf build", "description": "delete",
+                "event": "approval.request", "request_id": "appr-1", "command": "rm -rf build", "description": "delete",
             }}
         return {"run_id": run_id, "status": "completed", "output": "approved and done"}
 
     monkeypatch.setattr(gateway_chat, "_get_gateway_run_status", fake_status)
     monkeypatch.setattr(
         gateway_chat, "_relay_gateway_run_approval",
-        lambda session_id, run_id, payload, *a, **k: relayed.append((session_id, run_id, payload["approval_id"])) or True,
+        lambda session_id, run_id, payload, *a, **k: relayed.append((session_id, run_id, payload["request_id"])) or True,
     )
     gateway_chat.resume_gateway_runs_after_restart()
     _wait_for_reattach_threads()
@@ -630,9 +630,8 @@ def test_approval_reply_reaches_the_gateway_that_owns_a_reattached_run(
     _two_profile_gateways(tmp_path, monkeypatch, process_profile)
     monkeypatch.setattr(gateway_chat, "_get_gateway_run_status", lambda b, k, r: {
         "run_id": r, "status": "waiting_for_approval",
-        "approval": {"event": "approval.request", "approval_id": "appr-1", "command": "rm -rf build", "description": "d"},
+        "approval": {"event": "approval.request", "request_id": "appr-1", "command": "rm -rf build", "description": "d"},
     })
-    monkeypatch.setattr(config, "gateway_supports_approval_identity_v1", lambda *a, **k: True)
     replies = []
 
     def fake_respond(self, run_id, approval_id, choice):
@@ -651,7 +650,9 @@ def test_approval_reply_reaches_the_gateway_that_owns_a_reattached_run(
         routes._handle_approval_respond(handler, {"session_id": sid, "choice": "once", "approval_id": "appr-1"})
 
         handler.send_response.assert_called_with(200)
-        assert replies == [(f"http://{session_profile}-gateway:8642", f"{session_profile}-key", "run_parked", "appr-1", "once")]
+        # An in-process approval has no execution generation: it is answered as
+        # the head of the run's queue, on the Gateway that owns the run.
+        assert replies == [(f"http://{session_profile}-gateway:8642", f"{session_profile}-key", "run_parked", "", "once")]
     finally:
         streaming.cancel_stream(stream_id)
         _wait_for_reattach_threads()
@@ -830,14 +831,14 @@ def test_reattach_polls_without_replay_when_the_journal_read_fails(isolated_sess
 def test_reattach_resurfaces_an_approval_relayed_before_the_restart(isolated_sessions, monkeypatch):
     sid, stream_id = _orphaned_gateway_turn(run_id="run_parked_stream")
     _relayed_before_restart(sid, stream_id, [("token", {"text": "checking ", "gateway_seq": 0})])
-    parked = {"event": "approval.request", "approval_id": "appr-9", "command": "rm x", "description": "d"}
+    parked = {"event": "approval.request", "request_id": "appr-9", "command": "rm x", "description": "d"}
     relayed = []
     monkeypatch.setattr(gateway_chat, "_get_gateway_run_status", lambda b, k, r: {
         "run_id": r, "status": "waiting_for_approval", "approval": parked,
     })
     monkeypatch.setattr(
         gateway_chat, "_relay_gateway_run_approval",
-        lambda session_id, run_id, payload, *a, **k: relayed.append(payload["approval_id"]) or True,
+        lambda session_id, run_id, payload, *a, **k: relayed.append(payload["request_id"]) or True,
     )
     monkeypatch.setattr(gateway_chat, "_open_gateway_run_events", lambda b, h, r, last_seq=-1, **_kw: _sse(
         (2, {"event": "message.delta", "delta": "done"}), (3, {"event": "run.completed"}),
@@ -851,7 +852,7 @@ def test_reattach_resurfaces_an_approval_relayed_before_the_restart(isolated_ses
 
 def test_reattach_cursor_includes_a_journaled_approval_so_it_is_not_relayed_twice(isolated_sessions, monkeypatch):
     sid, stream_id = _orphaned_gateway_turn(run_id="run_parked_journaled")
-    parked = {"event": "approval.request", "approval_id": "appr-7", "command": "rm y", "description": "d"}
+    parked = {"event": "approval.request", "request_id": "appr-7", "command": "rm y", "description": "d"}
     _relayed_before_restart(sid, stream_id, [
         ("token", {"text": "checking ", "gateway_seq": 0}),
         ("approval", {"approval_id": "appr-7", "command": "rm y", "pending_count": 1, "gateway_seq": 1}),
@@ -862,7 +863,7 @@ def test_reattach_cursor_includes_a_journaled_approval_so_it_is_not_relayed_twic
     })
     monkeypatch.setattr(
         gateway_chat, "_relay_gateway_run_approval",
-        lambda session_id, run_id, payload, *a, **k: relayed.append(payload["approval_id"]) or True,
+        lambda session_id, run_id, payload, *a, **k: relayed.append(payload["request_id"]) or True,
     )
     history = [(1, parked), (2, {"event": "message.delta", "delta": "done"}), (3, {"event": "run.completed"})]
 
@@ -917,14 +918,14 @@ def test_reattach_probe_and_replay_surface_one_approval_once(isolated_sessions, 
     sid, stream_id = _orphaned_gateway_turn(run_id="run_parked_replayed")
     if journaled:
         _relayed_before_restart(sid, stream_id, [("token", {"text": "checking ", "gateway_seq": 0})])
-    parked = {"event": "approval.request", "approval_id": "appr-3", "command": "rm z", "description": "d"}
+    parked = {"event": "approval.request", "request_id": "appr-3", "command": "rm z", "description": "d"}
     order = []
     monkeypatch.setattr(gateway_chat, "_get_gateway_run_status", lambda b, k, r: order.append("probe") or {
         "run_id": r, "status": "waiting_for_approval", "approval": parked,
     })
     monkeypatch.setattr(
         gateway_chat, "_relay_gateway_run_approval",
-        lambda session_id, run_id, payload, *a, **k: order.append(("approval", payload["approval_id"])) or True,
+        lambda session_id, run_id, payload, *a, **k: order.append(("approval", payload["request_id"])) or True,
     )
 
     def open_events(base_url, headers, run_id, last_seq=-1, **_kw):
@@ -958,13 +959,13 @@ def test_reattach_saves_the_run_output_over_the_restored_partial(isolated_sessio
 def test_reattach_drops_a_replayed_approval_the_gateway_already_settled(isolated_sessions, monkeypatch):
     sid, stream_id = _orphaned_gateway_turn(run_id="run_auto_approved")
     _relayed_before_restart(sid, stream_id, [("token", {"text": "checking ", "gateway_seq": 0})])
-    stale = {"event": "approval.request", "approval_id": "appr-auto", "command": "ls", "description": "d"}
+    stale = {"event": "approval.request", "request_id": "appr-auto", "command": "ls", "description": "d"}
     relayed, opened = [], []
     # Auto-approved before the restart (no journal row): the run is running again, nothing parked.
     monkeypatch.setattr(gateway_chat, "_get_gateway_run_status", lambda b, k, r: {"run_id": r, "status": "running"})
     monkeypatch.setattr(
         gateway_chat, "_relay_gateway_run_approval",
-        lambda session_id, run_id, payload, *a, **k: relayed.append(payload["approval_id"]) or True,
+        lambda session_id, run_id, payload, *a, **k: relayed.append(payload["request_id"]) or True,
     )
     history = [(1, stale), (2, {"event": "message.delta", "delta": "done"}), (3, {"event": "run.completed"})]
 
