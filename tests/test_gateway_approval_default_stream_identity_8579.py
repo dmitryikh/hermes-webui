@@ -37,9 +37,9 @@ from api.config import STREAMS, STREAMS_LOCK
 from api.gateway_chat import (
     _STREAM_RUN_IDS,
     _gateway_runs_approval_event,
-    _relay_gateway_run_approval,
     _run_gateway_chat_streaming,
 )
+from api.gateway_transport_runs import _relay_gateway_run_approval
 
 REPO_ROOT = Path(__file__).parent.parent
 
@@ -316,15 +316,17 @@ class TestSharedIdentityDecision:
         The maintainer's requirement is one shared creation-time decision; a
         duplicated expression in the relay would let the two origins drift.
         """
-        src = (REPO_ROOT / "api" / "gateway_chat.py").read_text(encoding="utf-8")
+        src = (REPO_ROOT / "api" / "gateway_transport_runs.py").read_text(encoding="utf-8")
         relay_start = src.index("def _relay_gateway_run_approval(")
         relay_end = src.index("\ndef ", relay_start + 10)
         relay_body = src[relay_start:relay_end]
         assert "_gateway_approval_identity_v1(" in relay_body, (
             "the Runs API relay must delegate to the shared identity helper"
         )
+        src = (REPO_ROOT / "api" / "gateway_transport_chat.py").read_text(encoding="utf-8")
         stream_start = src.index("def _relay_chat_completion_approval(")
-        stream_body = src[stream_start:src.index("\ndef ", stream_start + 10)]
+        stream_end = src.find("\ndef ", stream_start + 10)
+        stream_body = src[stream_start:stream_end if stream_end >= 0 else len(src)]
         assert "_gateway_approval_identity_v1(" in stream_body, (
             "the default chat-completions stream must delegate to the shared identity helper"
         )

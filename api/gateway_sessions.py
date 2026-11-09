@@ -12,6 +12,8 @@ from pathlib import Path
 import re
 import threading
 
+from api.gateway_transport import GatewayTransport, GatewayTurn, TurnOutcomeUnknown, TurnResult
+
 
 _LOCAL_SOURCES = frozenset({"cli", "tui", "desktop", "gui", "local", "acp"})
 _MESSAGING_SOURCES = frozenset({"telegram", "discord", "slack", "whatsapp", "signal",
@@ -25,7 +27,7 @@ class SessionTransportError(ValueError):
     """Bounded public failure; never a raw socket URL, credential or remote traceback."""
 
 
-class SessionTransportDisconnected(SessionTransportError):
+class SessionTransportDisconnected(SessionTransportError, TurnOutcomeUnknown):
     """Preserve the existing durable request so reopening recovers, never resends."""
 
 
@@ -493,3 +495,24 @@ def run_session(session, stream_id, text, *, emit, cancel, record, saved=None):
                          recovering=bool(saved))
     text, usage = asyncio.run(relay.run())
     return text, usage, relay.snapshot
+
+
+class SessionProtocolTransport(GatewayTransport):
+    """Run the turn over the Agent's canonical session protocol (``hermes-gateway-v1``).
+
+    Used to continue sessions another client owns (CLI, TUI, Desktop,
+    messaging). The Gateway owns admission, configuration and history; its
+    canonical transcript replaces the WebUI-built rows on success. A lost
+    connection with an unknown outcome raises ``SessionTransportDisconnected``
+    (a ``TurnOutcomeUnknown``) so the pending turn is preserved.
+    """
+
+    name = "session"
+    durable = True
+
+    def run(self, turn: GatewayTurn) -> TurnResult:
+        text, usage, snapshot = run_session(
+            turn.session, turn.stream_id, turn.msg_text, emit=turn.emit, cancel=turn.cancel_event,
+            record=turn.record_run, saved=turn.reattach_run,
+        )
+        return TurnResult(text=text, usage=usage, canonical_snapshot=snapshot)

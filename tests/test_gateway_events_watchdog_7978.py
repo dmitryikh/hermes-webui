@@ -155,7 +155,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import api.config as _config  # noqa: E402
 import api.gateway_chat as gc  # noqa: E402
-from api.gateway_chat import GATEWAY_REATTACH_MAX_POLL_FAILURES, GATEWAY_REATTACH_POLL_INTERVAL  # noqa: E402
+from api import gateway_transport_runs as gateway_runs  # noqa: E402
+from api.gateway_transport_runs import GATEWAY_REATTACH_MAX_POLL_FAILURES, GATEWAY_REATTACH_POLL_INTERVAL  # noqa: E402
 
 BASE_URL = "http://gateway.test"
 STREAM_ID = "watchdog-harness-stream"
@@ -435,9 +436,9 @@ def run_turn(*, urlopen_script=(), status_script=(), cancel_event=None, clock=No
         return 0, None, 0
 
     try:
-        patch(gc, "time", types.SimpleNamespace(monotonic=clock.monotonic))
-        patch(gc, "_admit_gateway_run", lambda *a, **k: RUN_ID)
-        patch(gc, "_get_gateway_run_status", traced("status", status))
+        patch(gateway_runs, "time", types.SimpleNamespace(monotonic=clock.monotonic))
+        patch(gateway_runs, "_admit_gateway_run", lambda *a, **k: RUN_ID)
+        patch(gateway_runs, "_get_gateway_run_status", traced("status", status))
         patch(gc, "_settle_gateway_cancelled_turn", traced_cancel_settle)
         patch(urllib.request, "urlopen", traced("events", urlopen))
         for obj, name, value in extra_patches:
@@ -455,7 +456,7 @@ def run_turn(*, urlopen_script=(), status_script=(), cancel_event=None, clock=No
     gc.logger.setLevel(logging.CRITICAL)
     try:
         try:
-            result = gc._run_gateway_runs_api_streaming(
+            result = gateway_runs._run_gateway_runs_api_streaming(
                 "sess-watchdog-harness", "hi", "test-model", "/tmp", STREAM_ID,
                 BASE_URL, "test-key", [], {},
                 put_gateway_event=lambda name, payload: events.append((name, payload)),
@@ -798,16 +799,16 @@ def test_stop_between_grace_probes_surfaces_cancel_without_reconnect():
         setattr(obj, name, value)
 
     events = []
-    patch(gc, "time", types.SimpleNamespace(monotonic=clock.monotonic))
-    patch(gc, "_admit_gateway_run", lambda *a, **k: RUN_ID)
-    patch(gc, "_get_gateway_run_status", status_after_stop)
+    patch(gateway_runs, "time", types.SimpleNamespace(monotonic=clock.monotonic))
+    patch(gateway_runs, "_admit_gateway_run", lambda *a, **k: RUN_ID)
+    patch(gateway_runs, "_get_gateway_run_status", status_after_stop)
     patch(urllib.request, "urlopen", urlopen)
     import api.route_approvals as ra
 
     patch(ra, "settle_gateway_pending_run", lambda *a, **k: (0, None, 0))
     _config.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
     try:
-        result = gc._run_gateway_runs_api_streaming(
+        result = gateway_runs._run_gateway_runs_api_streaming(
             "sess-watchdog-harness", "hi", "test-model", "/tmp", STREAM_ID,
             BASE_URL, "test-key", [], {},
             put_gateway_event=lambda name, payload: events.append((name, payload)),
@@ -1454,7 +1455,7 @@ def test_live_and_resumed_turns_share_one_recovery_procedure():
     follower: both entry points delegate to ``_GatewayRunFollower`` and neither
     keeps a private consume/poll loop."""
     import inspect
-    for entry in (gc._run_gateway_runs_api_streaming, gc._await_gateway_run_result):
+    for entry in (gateway_runs._run_gateway_runs_api_streaming, gateway_runs._await_gateway_run_result):
         src = inspect.getsource(entry)
         assert "_GatewayRunFollower(" in src
         assert "while True" not in src
@@ -1590,9 +1591,9 @@ def test_r4_status_lane_cancel_persists_before_cancel_event():
                 refetch_at_event.append(
                     (len(partials), partials[0].get("content") if partials else None))
 
-        patch(gc, "time", types.SimpleNamespace(monotonic=clock.monotonic))
-        patch(gc, "_admit_gateway_run", lambda *a, **k: RUN_ID)
-        patch(gc, "_get_gateway_run_status", status)
+        patch(gateway_runs, "time", types.SimpleNamespace(monotonic=clock.monotonic))
+        patch(gateway_runs, "_admit_gateway_run", lambda *a, **k: RUN_ID)
+        patch(gateway_runs, "_get_gateway_run_status", status)
         patch(urllib.request, "urlopen", urlopen)
         import api.route_approvals as ra
 
@@ -1601,7 +1602,7 @@ def test_r4_status_lane_cancel_persists_before_cancel_event():
         _config.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
         _config.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
         try:
-            result = gc._run_gateway_runs_api_streaming(
+            result = gateway_runs._run_gateway_runs_api_streaming(
                 sid, "hi", "test-model", "/tmp", STREAM_ID,
                 BASE_URL, "test-key", [], {},
                 put_gateway_event=on_event,
@@ -1696,9 +1697,9 @@ def test_stop_is_honoured_between_probe_retries():
         setattr(obj, name, value)
 
     events = []
-    patch(gc, "time", types.SimpleNamespace(monotonic=clock.monotonic))
-    patch(gc, "_admit_gateway_run", lambda *a, **k: RUN_ID)
-    patch(gc, "_get_gateway_run_status", status)
+    patch(gateway_runs, "time", types.SimpleNamespace(monotonic=clock.monotonic))
+    patch(gateway_runs, "_admit_gateway_run", lambda *a, **k: RUN_ID)
+    patch(gateway_runs, "_get_gateway_run_status", status)
     patch(urllib.request, "urlopen", urlopen)
 
     import api.route_approvals as ra
@@ -1706,7 +1707,7 @@ def test_stop_is_honoured_between_probe_retries():
     patch(ra, "settle_gateway_pending_run", lambda *a, **k: (0, None, 0))
     _config.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
     try:
-        result = gc._run_gateway_runs_api_streaming(
+        result = gateway_runs._run_gateway_runs_api_streaming(
             "sess-watchdog-harness", "hi", "test-model", "/tmp", STREAM_ID,
             BASE_URL, "test-key", [], {},
             put_gateway_event=lambda name, payload: events.append((name, payload)),
@@ -1795,14 +1796,14 @@ def test_completed_status_stream_writeback_overwrites_partial_text():
         saved.append((obj, name, getattr(obj, name)))
         setattr(obj, name, value)
 
-    patch(gc, "time", types.SimpleNamespace(monotonic=clock.monotonic))
-    patch(gc, "_admit_gateway_run", lambda *a, **k: RUN_ID)
-    patch(gc, "_get_gateway_run_status", status)
+    patch(gateway_runs, "time", types.SimpleNamespace(monotonic=clock.monotonic))
+    patch(gateway_runs, "_admit_gateway_run", lambda *a, **k: RUN_ID)
+    patch(gateway_runs, "_get_gateway_run_status", status)
     patch(urllib.request, "urlopen", urlopen)
     patch(ra, "settle_gateway_pending_run", lambda *a, **k: (0, None, 0))
     _config.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
     try:
-        result = gc._run_gateway_runs_api_streaming(
+        result = gateway_runs._run_gateway_runs_api_streaming(
             "sess-watchdog-harness", "hi", "test-model", "/tmp", STREAM_ID,
             BASE_URL, "test-key", [], {},
             put_gateway_event=lambda name, payload: None,

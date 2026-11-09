@@ -62,9 +62,12 @@ actions. The topbar remains focused on conversation context and the workspace/fi
       gateway_sse.py       Gateway bridge layer 1: SSE line framing, read-timeout budget, Stop-aware reads
       gateway_events.py    Gateway bridge layer 2: typed Hermes events + one decoder per wire dialect
       gateway_projection.py Gateway bridge layer 3: Gateway events -> WebUI events + live reconnect snapshot
-      gateway_chat.py      Gateway bridge orchestration: request build, admission, reconnect/watchdog,
-                           durable run status, approvals, terminal settlement and persistence
-      gateway_sessions.py  Canonical session-protocol transport (JSON-RPC lane of the Gateway bridge)
+      gateway_transport.py Gateway transport abstraction: GatewayTurn, TurnResult, GatewayTransport, selection
+      gateway_transport_chat.py Chat Completions transport (stateless /v1/chat/completions stream)
+      gateway_transport_runs.py Runs API transport (durable /v1/runs, reconnect/watchdog, reattach)
+      gateway_sessions.py  Session-protocol transport (canonical sessions over the profile's private socket)
+      gateway_chat.py      Gateway turn lifecycle: admission, journal, transport selection, settlement,
+                           teardown; shared approval and run-lifecycle services for the transports
       helpers.py           HTTP helpers: j(), bad(), require(), safe_resolve(), security headers
       goals.py             Persistent-goal commands and profile-scoped native GoalManager bridge
       models.py            Session model + CRUD, per-session profile/model/reasoning tracking, CLI/state.db bridge
@@ -407,8 +410,23 @@ fires (within the same SSE stream), without waiting for the next poll cycle.
 #### Gateway-backed turns (`HERMES_WEBUI_CHAT_BACKEND=gateway`)
 
 A Gateway-backed turn keeps the same browser contract, but its events come from
-the Hermes Gateway. Each processing level lives in its own module and talks to
-the next level only through its output type:
+the Hermes Gateway. `_run_gateway_chat_streaming` (`api/gateway_chat.py`) owns the
+transport-independent lifecycle — stream admission, run journal, session/profile
+resolution, prefill and request options, settlement of the outcome (cancelled,
+failed, empty, success writeback, goal hook, `done`) and teardown. The only
+transport-specific step is `transport.run(GatewayTurn) -> TurnResult`
+(`api/gateway_transport.py`), with three implementations:
+
+| Transport | Module | When | Run identity |
+|---|---|---|---|
+| `ChatCompletionsTransport` | `gateway_transport_chat.py` | default | none: no reattach, remote Stop or Steer |
+| `RunsApiTransport` | `gateway_transport_runs.py` | Runs API enabled and the Gateway relays approvals, or a reattached run | durable run id; reconnect and reattach |
+| `SessionProtocolTransport` | `gateway_sessions.py` | an external session opted into `webui_gateway_session_transport` | canonical session admission |
+
+A transport reports cancellation as `text=None`, failure as `error` or any
+exception, and an unknown outcome as `TurnOutcomeUnknown` (the pending turn is
+preserved). Inside the transports, each processing level lives in its own module
+and talks to the next level only through its output type:
 
     HTTP response bytes
       -> api/gateway_sse.py         iter_sse_frames()         -> SseFrame(event, data)
@@ -418,8 +436,9 @@ the next level only through its output type:
       -> api/gateway_projection.py  GatewayEventProjector      -> WebUI event (journaled
                                                                   + queued) and
                                                                   LiveTurnSnapshot update
-      -> api/gateway_chat.py        run orchestration: reconnect, watchdog, durable
-                                    run status, approvals, terminal settlement
+      -> transport                  connection, approvals, terminal events
+                                    (Runs API: reconnect, watchdog, durable status)
+      -> api/gateway_chat.py        transport-independent settlement of the turn
 
 - Layer 1 knows SSE grammar and read timeouts only; layer 2 is pure decoding
   into typed events (`TextDelta`, `ReasoningDelta`, `ToolProgress`,
@@ -427,7 +446,8 @@ the next level only through its output type:
   layer 3 owns the stream's reconnect snapshot rows
   (`STREAM_PARTIAL_TEXT`, `STREAM_REASONING_TEXT`, `STREAM_LIVE_TOOL_CALLS`).
 - Control events (approvals, terminal run events, replay truncation) are not
-  projected: their side effects are orchestration and stay in `gateway_chat.py`.
+  projected: their side effects belong to the transport and the shared approval
+  services in `gateway_chat.py`.
 - Layer 2 decodes only the shapes the current Hermes Agent API server emits
   (`gateway/platforms/api_server_runs.py`, `api_server_openai_routes.py`,
   `gateway/run_turn_progress.py`): Runs API `_run_event` envelopes named by
@@ -446,7 +466,7 @@ the next level only through its output type:
 Recovery is one procedure for every Runs API turn. A `TurnCheckpoint` (the
 Gateway cursor of the last relayed frame plus the snapshot it produced) is the
 only resume state: the relay updates it in place frame by frame, so a dying
-connection loses nothing. `_GatewayRunFollower` follows the run from a
+connection loses nothing. `_GatewayRunFollower` (`api/gateway_transport_runs.py`) follows the run from a
 checkpoint, and every lost connection — read timeout, reset, HTTP error, clean
 EOF, watchdog stall, WebUI restart — goes through its `recover()`: probe the
 durable run status, surface a parked approval, settle a terminal run from the

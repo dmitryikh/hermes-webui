@@ -15,23 +15,9 @@ import pytest
 from api.gateway_chat import _gateway_runs_approval_event
 from api.gateway_events import ApprovalRequest, decode_chat_completion_frame
 from api.gateway_sse import iter_sse_frames
+from api import gateway_transport_chat as gateway_chat_transport
 
 REPO_ROOT = Path(__file__).parent.parent
-GATEWAY_CHAT_SRC = (REPO_ROOT / "api" / "gateway_chat.py").read_text(encoding="utf-8")
-
-_LEGACY_MARKER = 'url = f"{base_url}/v1/chat/completions"'
-_NEXT_FUNC_RE = "\ndef "
-
-
-def _extract_legacy_sse_loop():
-    """Extract the legacy /v1/chat/completions SSE relay function body."""
-    start = GATEWAY_CHAT_SRC.find(_LEGACY_MARKER)
-    assert start >= 0, "Legacy chat/completions path not found in gateway_chat.py"
-    end = GATEWAY_CHAT_SRC.find(_NEXT_FUNC_RE, start)
-    if end < 0:
-        end = len(GATEWAY_CHAT_SRC)
-    return GATEWAY_CHAT_SRC[start:end]
-
 
 def _drain_queue(q):
     import queue
@@ -93,10 +79,12 @@ def test_chat_decoder_approval_event_name_does_not_bleed():
 
 
 def test_legacy_loop_dispatches_approvals_to_the_card_relay():
-    """The /v1/chat/completions loop hands decoded approvals to the shared card relay."""
-    start = GATEWAY_CHAT_SRC.find(_LEGACY_MARKER)
-    assert start >= 0, "Legacy chat/completions path not found in gateway_chat.py"
-    loop = GATEWAY_CHAT_SRC[start:GATEWAY_CHAT_SRC.find(_NEXT_FUNC_RE, start)]
+    """The /v1/chat/completions transport hands decoded approvals to the shared card relay."""
+    import inspect
+
+    from api.gateway_transport_chat import ChatCompletionsTransport
+
+    loop = inspect.getsource(ChatCompletionsTransport.run)
     assert "decode_chat_completion_frame(" in loop
     assert "_relay_chat_completion_approval(" in loop
 
@@ -112,13 +100,13 @@ def test_legacy_card_relay_maps_mirrors_and_emits_the_approval():
         return {**approval_data, "mirrored": True}, 2
 
     with patch.object(gateway_chat, "_submit_stream_approval_mirror", side_effect=mirror):
-        relayed = gateway_chat._relay_chat_completion_approval(
+        relayed = gateway_chat_transport._relay_chat_completion_approval(
             "sid-legacy", "stream-legacy",
             {"command": "rm -rf /tmp/x", "request_id": "a1", "run_id": "run-legacy"},
             "http://gateway.test", "",
             cancel_event=threading.Event(), put_gateway_event=lambda e, d: events.append((e, d)),
         )
-        assert gateway_chat._relay_chat_completion_approval(
+        assert gateway_chat_transport._relay_chat_completion_approval(
             "sid-legacy", "stream-legacy", {"risk_level": "high"}, "http://gateway.test", "",
             cancel_event=threading.Event(), put_gateway_event=lambda e, d: events.append((e, d)),
         ) is False
@@ -217,7 +205,7 @@ def test_legacy_sse_loop_relays_approval_event():
 
     try:
         with patch.dict("os.environ", {"HERMES_WEBUI_CHAT_BACKEND": "gateway"}):
-            with patch("api.gateway_chat.gateway_supports_approval", return_value=False), \
+            with patch("api.gateway_transport.gateway_supports_approval", return_value=False), \
                  patch("urllib.request.urlopen", side_effect=fake_urlopen), \
                  patch("api.gateway_chat.get_session", return_value=mock_session), \
                  patch("api.gateway_chat._stream_writeback_is_current", return_value=True), \
@@ -318,7 +306,7 @@ def test_legacy_approval_records_run_id_for_response_relay():
 
     try:
         with patch.dict("os.environ", {"HERMES_WEBUI_CHAT_BACKEND": "gateway"}):
-            with patch("api.gateway_chat.gateway_supports_approval", return_value=False), \
+            with patch("api.gateway_transport.gateway_supports_approval", return_value=False), \
                  patch("urllib.request.urlopen", side_effect=fake_urlopen), \
                  patch("api.gateway_chat.get_session", return_value=mock_session), \
                  patch("api.gateway_chat._stream_writeback_is_current", return_value=True), \
@@ -440,7 +428,7 @@ def test_legacy_teardown_clears_stale_gateway_mirror_and_notifies_empty_state():
                 ra._gateway_queues.pop(session_id, None)
 
         with patch.dict("os.environ", {"HERMES_WEBUI_CHAT_BACKEND": "gateway"}):
-            with patch("api.gateway_chat.gateway_supports_approval", return_value=False), \
+            with patch("api.gateway_transport.gateway_supports_approval", return_value=False), \
                  patch("urllib.request.urlopen", side_effect=_make_legacy_gateway_urlopen(approval_payload, clear_gateway_queue)), \
                  patch("api.gateway_chat.get_session", return_value=mock_session), \
                  patch("api.gateway_chat._stream_writeback_is_current", return_value=True), \
@@ -515,7 +503,7 @@ def test_legacy_teardown_retires_live_gateway_head_mirror():
             STREAMS[stream_id] = q
 
         with patch.dict("os.environ", {"HERMES_WEBUI_CHAT_BACKEND": "gateway"}):
-            with patch("api.gateway_chat.gateway_supports_approval", return_value=False), \
+            with patch("api.gateway_transport.gateway_supports_approval", return_value=False), \
                  patch("urllib.request.urlopen", side_effect=_make_legacy_gateway_urlopen(approval_payload)), \
                  patch("api.gateway_chat.get_session", return_value=mock_session), \
                  patch("api.gateway_chat._stream_writeback_is_current", return_value=True), \
@@ -595,7 +583,7 @@ def test_legacy_teardown_preserves_local_pending_entry():
             STREAMS[stream_id] = q
 
         with patch.dict("os.environ", {"HERMES_WEBUI_CHAT_BACKEND": "gateway"}):
-            with patch("api.gateway_chat.gateway_supports_approval", return_value=False), \
+            with patch("api.gateway_transport.gateway_supports_approval", return_value=False), \
                  patch("urllib.request.urlopen", side_effect=_make_legacy_gateway_urlopen(approval_payload)), \
                  patch("api.gateway_chat.get_session", return_value=mock_session), \
                  patch("api.gateway_chat._stream_writeback_is_current", return_value=True), \
@@ -832,7 +820,7 @@ def test_legacy_approval_without_run_id_retires_locally():
 
     try:
         with patch.dict("os.environ", {"HERMES_WEBUI_CHAT_BACKEND": "gateway"}):
-            with patch("api.gateway_chat.gateway_supports_approval", return_value=False), \
+            with patch("api.gateway_transport.gateway_supports_approval", return_value=False), \
                  patch("urllib.request.urlopen", side_effect=fake_urlopen), \
                  patch("api.gateway_chat.get_session", return_value=mock_session), \
                  patch("api.gateway_chat._stream_writeback_is_current", return_value=True), \

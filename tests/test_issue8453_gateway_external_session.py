@@ -15,6 +15,7 @@ import urllib.error
 import pytest
 
 import api.gateway_chat as gateway_chat
+from api import gateway_transport
 import api.helpers as helpers
 import api.models as models
 import api.routes as routes
@@ -94,7 +95,7 @@ def test_gateway_http_refusal_survives_event_settlement_and_reload(tmp_path, mon
     monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
     monkeypatch.setattr(models, "SESSIONS", OrderedDict())
     monkeypatch.setenv("HERMES_WEBUI_GATEWAY_USE_RUNS_API", str(runs).lower())
-    monkeypatch.setattr(gateway_chat, "gateway_supports_approval", lambda *a: True)
+    monkeypatch.setattr(gateway_transport, "gateway_supports_approval", lambda *a: True)
     monkeypatch.setattr(streaming, "_load_webui_prefill_context", lambda cfg: {"status": "not_configured", "messages": []})
     monkeypatch.setattr(streaming, "_prefill_messages_with_webui_context", lambda *a: [])
 

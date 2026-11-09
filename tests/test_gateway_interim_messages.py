@@ -9,6 +9,8 @@ from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 from api import gateway_chat as g, config, models, run_journal
+from api import gateway_transport_runs as gateway_runs
+from api import gateway_transport
 from api.gateway_projection import LiveTurnSnapshot, TurnCheckpoint
 import pytest
 from unittest.mock import MagicMock
@@ -37,7 +39,7 @@ def test_success_writeback_keeps_commentary_outside_model_context(monkeypatch, t
     monkeypatch.setattr(g, 'get_session', lambda *a: session)
     monkeypatch.setattr('api.gateway_delegation_wakeup.settle_reservation', lambda *a,**k: None)
     monkeypatch.setattr(g, '_stream_writeback_is_current', lambda *a: True)
-    monkeypatch.setattr(g, 'gateway_supports_approval', lambda *a: True)
+    monkeypatch.setattr(gateway_transport, 'gateway_supports_approval', lambda *a: True)
     monkeypatch.setattr(g, '_gateway_use_runs_api_enabled', lambda *a: True)
     monkeypatch.setattr(g, '_gateway_endpoint_for_profile', lambda *a: ('http://unused',''))
     monkeypatch.setattr(g, '_gateway_config_for_profile', lambda *a: {'model':{}})
@@ -56,14 +58,14 @@ def test_success_writeback_keeps_commentary_outside_model_context(monkeypatch, t
     if not real_disk:
         monkeypatch.setattr(g, 'RunJournalWriter', Journal)
     def run(*a,put_gateway_event, cancel_event, **k):
-        return g._relay_gateway_run_events([
+        return gateway_runs._relay_gateway_run_events([
             frame('message.delta',1,delta='Checking.'),
             frame('message.interim',2,text='Checking.',already_streamed=True),
             frame('message.interim',3,text='Confirmed.',already_streamed=False),
             frame('message.delta',4,delta='Final.'),
             frame('run.completed',5,output='Final.'),
         ],'sid','stream','run','http://unused','',put_gateway_event=put_gateway_event,cancel_event=cancel_event)[:2]
-    monkeypatch.setattr(g, '_run_gateway_runs_api_streaming', run)
+    monkeypatch.setattr(gateway_runs, '_run_gateway_runs_api_streaming', run)
     g._run_gateway_chat_streaming('sid','question','model',str(ROOT),'stream')
     assert [(m['role'],m['content']) for m in session.messages] == [('user','question'),('assistant','Checking.'),('assistant','Confirmed.'),('assistant','Final.')]
     assert [(m['role'],m['content']) for m in session.context_messages] == [('user','question'),('assistant','Final.')]
@@ -107,7 +109,7 @@ def test_terminal_writeback_retains_sealed_commentary(monkeypatch, tmp_path, ter
     monkeypatch.setitem(g.STREAMS, 'stream', config.create_stream_channel())
     monkeypatch.setattr(g, 'get_session', lambda *a: session)
     monkeypatch.setattr('api.gateway_delegation_wakeup.settle_reservation', lambda *a, **k: None)
-    monkeypatch.setattr(g, 'gateway_supports_approval', lambda *a: True)
+    monkeypatch.setattr(gateway_transport, 'gateway_supports_approval', lambda *a: True)
     monkeypatch.setattr(g, '_gateway_use_runs_api_enabled', lambda *a: True)
     monkeypatch.setattr(g, '_gateway_endpoint_for_profile', lambda *a: ('http://unused', ''))
     monkeypatch.setattr(g, '_gateway_config_for_profile', lambda *a: {'model': {}})
@@ -181,7 +183,7 @@ def test_terminal_writeback_retains_sealed_commentary(monkeypatch, tmp_path, ter
     reloaded.pending_user_message = 'next question'
     monkeypatch.setitem(config.STREAM_PARTIAL_TEXT, 'next-stream', '')
     frames[:] = [frame('run.completed', 1, output='Next answer.')]
-    g._run_gateway_runs_api_streaming(
+    gateway_runs._run_gateway_runs_api_streaming(
         'sid', 'next question', 'model', str(ROOT), 'next-stream',
         'http://unused', '', [], {}, session=reloaded,
         put_gateway_event=lambda *a: None, cancel_event=threading.Event(),
@@ -240,7 +242,7 @@ def test_sealed_tool_keeps_later_completion(monkeypatch):
 @pytest.fixture(autouse=True)
 def isolation(monkeypatch, tmp_path):
     monkeypatch.setattr('api.route_approvals.settle_gateway_pending_run', lambda *a, **k: None)
-    monkeypatch.setattr(g, 'update_active_run', lambda *a, **k: None)
+    monkeypatch.setattr(gateway_runs, 'update_active_run', lambda *a, **k: None)
     monkeypatch.setitem(config.STREAM_PARTIAL_TEXT, 'stream', '')
     monkeypatch.setitem(config.STREAM_REASONING_TEXT, 'stream', '')
     monkeypatch.setitem(config.STREAM_LIVE_TOOL_CALLS, 'stream', [])
@@ -250,7 +252,7 @@ def frame(event, seq, **data):
 
 def relay(frames, **kwargs):
     events, seqs = [], []
-    result = g._relay_gateway_run_events(frames, 'sid', 'stream', 'run', 'http://unused', '',
+    result = gateway_runs._relay_gateway_run_events(frames, 'sid', 'stream', 'run', 'http://unused', '',
         put_gateway_event=lambda e,d: events.append((e,d)), cancel_event=threading.Event(),
         on_seq=seqs.append, **kwargs)
     return result, events, seqs

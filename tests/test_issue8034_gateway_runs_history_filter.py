@@ -91,7 +91,8 @@ class _SseResponse:
 def _gateway_history(context_messages, *, tag: str) -> list[dict]:
     """The ``conversation_history`` the runs-API bridge posts for this session."""
     from api.config import STREAM_PARTIAL_TEXT, STREAM_REASONING_TEXT
-    from api.gateway_chat import _STREAM_RUN_IDS, _run_gateway_runs_api_streaming
+    from api.gateway_chat import _STREAM_RUN_IDS
+    from api.gateway_transport_runs import _run_gateway_runs_api_streaming
 
     stream_id = f"sid-8034-{tag}"
     bodies = []

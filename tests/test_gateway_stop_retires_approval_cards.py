@@ -51,6 +51,7 @@ import pytest
 
 import api.config as config
 import api.gateway_chat as gateway_chat
+from api import gateway_transport_chat as gateway_chat_transport
 import api.models as models
 import api.route_approvals as approvals
 import api.routes as routes
@@ -104,7 +105,7 @@ def gateway_env(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", BASE_URL)
     monkeypatch.setattr(gateway_chat, "_gateway_endpoint_for_profile", lambda profile: (BASE_URL, ""))
     monkeypatch.setattr(gateway_chat, "_gateway_reasoning_effort_for_request", lambda *a, **k: None)
-    monkeypatch.setattr(gateway_chat, "gateway_approval_unavailable_reason", lambda *a, **k: None)
+    monkeypatch.setattr(gateway_chat_transport, "gateway_approval_unavailable_reason", lambda *a, **k: None)
     monkeypatch.setattr(streaming, "_load_webui_prefill_context", lambda cfg: {
         "status": "not_configured", "source": "none", "label": "", "message_count": 0, "messages": [],
     })

@@ -12,7 +12,7 @@ from api.config import STREAMS, STREAMS_LOCK, invalidate_gateway_caps
 from api.gateway_chat import _run_gateway_chat_streaming
 
 REPO = Path(__file__).resolve().parents[1]
-GATEWAY_CHAT = (REPO / "api" / "gateway_chat.py").read_text(encoding="utf-8")
+GATEWAY_CHAT = (REPO / "api" / "gateway_transport_chat.py").read_text(encoding="utf-8")
 MESSAGES_JS = (REPO / "static" / "messages.js").read_text(encoding="utf-8")
 
 
@@ -57,8 +57,8 @@ def _run_gateway_warning_case(unavailable_reason: str) -> list:
 
     try:
         with patch.dict("os.environ", {"HERMES_WEBUI_CHAT_BACKEND": "gateway"}):
-            with patch("api.gateway_chat.gateway_supports_approval", return_value=False), \
-                 patch("api.gateway_chat.gateway_approval_unavailable_reason", return_value=unavailable_reason), \
+            with patch("api.gateway_transport.gateway_supports_approval", return_value=False), \
+                 patch("api.gateway_transport_chat.gateway_approval_unavailable_reason", return_value=unavailable_reason), \
                  patch("urllib.request.urlopen", side_effect=fake_urlopen), \
                  patch("api.gateway_chat.get_session", return_value=mock_session), \
                  patch("api.gateway_chat._stream_writeback_is_current", return_value=True), \

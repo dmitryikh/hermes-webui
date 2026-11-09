@@ -18,6 +18,7 @@ import pytest
 
 import api.config as config
 import api.gateway_chat as gateway_chat
+from api import gateway_transport_runs as gateway_runs
 from api.runner_client import RunnerClientError
 
 try:
@@ -539,7 +540,7 @@ def _run_with_approval_events(monkeypatch, *, yolo_enabled, auto_error=None):
             raise auto_error
 
     monkeypatch.setattr(gateway_chat.urllib.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(gateway_chat, "update_active_run", lambda *a, **k: None)
+    monkeypatch.setattr(gateway_runs, "update_active_run", lambda *a, **k: None)
     monkeypatch.setattr(gateway_chat, "_publish_gateway_run_id", lambda *a, **k: None)
     if yolo_enabled is not None:
         monkeypatch.setattr(gateway_chat, "_gateway_session_yolo_enabled", lambda _sid: yolo_enabled)
@@ -547,7 +548,7 @@ def _run_with_approval_events(monkeypatch, *, yolo_enabled, auto_error=None):
     monkeypatch.setattr("api.route_approvals.submit_gateway_pending_mirror", lambda _sid, data: (data, 1))
     monkeypatch.setattr("api.route_approvals.retire_gateway_pending_mirror", lambda *a, **k: None)
 
-    final, _usage = gateway_chat._run_gateway_runs_api_streaming(
+    final, _usage = gateway_runs._run_gateway_runs_api_streaming(
         "browser-session",
         "hello",
         "test-model",

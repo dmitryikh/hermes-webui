@@ -70,6 +70,7 @@ for _trial_dir in (
 import api.config as cfg  # noqa: E402
 import api.routes as routes  # noqa: E402
 from api.models import Session, get_session  # noqa: E402
+from api import gateway_transport
 
 GATEWAY_STORE: dict[str, list] = {}  # session_id -> gateway's own stored transcript
 CAPTURED_BODIES: list[dict] = []  # every /v1/runs admission body, in order
@@ -273,7 +274,8 @@ def teardown_stream_state(stream_id):
 
 def admit_run(session_id, *, msg_text, prefill_messages=None, context_messages=None, stream_id=None):
     """Drive the real _run_gateway_runs_api_streaming; return the captured body."""
-    from api.gateway_chat import _STREAM_RUN_IDS, _run_gateway_runs_api_streaming
+    from api.gateway_chat import _STREAM_RUN_IDS
+    from api.gateway_transport_runs import _run_gateway_runs_api_streaming
 
     del CAPTURED_BODIES[:]
     stream_id = stream_id or f"stream-admit-{session_id}"
@@ -734,7 +736,7 @@ class ReconciliationHarness(unittest.TestCase):
 
         with cfg.STREAMS_LOCK:
             cfg.STREAMS[stream_id] = create_stream_channel()
-        with patch.object(gateway_chat, "gateway_supports_approval", lambda *a, **k: True), \
+        with patch.object(gateway_transport, "gateway_supports_approval", lambda *a, **k: True), \
                 patch.object(gateway_chat.urllib.request, "urlopen", side_effect=fake_urlopen):
             gateway_chat._run_gateway_chat_streaming(
                 session_id, msg_text, "test-model", "/tmp", stream_id, [],
@@ -994,7 +996,7 @@ class ReconciliationHarness(unittest.TestCase):
 
         with cfg.STREAMS_LOCK:
             cfg.STREAMS[stream_id] = create_stream_channel()
-        with patch.object(gateway_chat, "gateway_supports_approval", lambda *a, **k: True), \
+        with patch.object(gateway_transport, "gateway_supports_approval", lambda *a, **k: True), \
                 patch.object(gateway_chat.urllib.request, "urlopen", side_effect=fallback_urlopen):
             gateway_chat._run_gateway_chat_streaming(
                 session_id, msg_text, "test-model", "/tmp", stream_id, [],

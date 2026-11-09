@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+from api import gateway_transport_runs as gateway_runs
 
 
 _MISSING = object()
@@ -312,8 +313,8 @@ def test_gateway_runs_api_submission():
 
     try:
         with patch.dict("os.environ", {"HERMES_WEBUI_CHAT_BACKEND": "gateway", "HERMES_WEBUI_GATEWAY_USE_RUNS_API": "1"}):
-            with patch("api.gateway_chat.gateway_supports_approval", lambda *_args, **_kwargs: True), \
-                 patch("api.gateway_chat._run_gateway_runs_api_streaming", fake_runs_streaming), \
+            with patch("api.gateway_transport.gateway_supports_approval", lambda *_args, **_kwargs: True), \
+                 patch("api.gateway_transport_runs._run_gateway_runs_api_streaming", fake_runs_streaming), \
                  patch("api.gateway_chat._gateway_reasoning_effort_for_request", return_value="high"), \
                  patch("api.gateway_chat.get_session", return_value=mock_session), \
                  patch("api.gateway_chat._stream_writeback_is_current", return_value=True), \
@@ -400,14 +401,14 @@ def test_gateway_terminal_event_fail_closes_parked_run_producer(
         with patch("urllib.request.urlopen", side_effect=fake_urlopen):
             if terminal_event == "run.failed":
                 with pytest.raises(RuntimeError, match="terminal failure"):
-                    gateway_chat._run_gateway_runs_api_streaming(
+                    gateway_runs._run_gateway_runs_api_streaming(
                         sid, "hi", "test", "/tmp", stream_id, "http://gw:8642", "", [], {},
                         put_gateway_event=lambda *_args: None,
                         cancel_event=threading.Event(),
                         session=SimpleNamespace(context_messages=[]),
                     )
             else:
-                gateway_chat._run_gateway_runs_api_streaming(
+                gateway_runs._run_gateway_runs_api_streaming(
                     sid, "hi", "test", "/tmp", stream_id, "http://gw:8642", "", [], {},
                     put_gateway_event=lambda *_args: None,
                     cancel_event=threading.Event(),
@@ -478,8 +479,8 @@ def test_gateway_stream_teardown_fail_closes_parked_run_producer():
         with patch.dict(
             "os.environ",
             {"HERMES_WEBUI_CHAT_BACKEND": "gateway", "HERMES_WEBUI_GATEWAY_USE_RUNS_API": "1"},
-        ), patch("api.gateway_chat.gateway_supports_approval", return_value=True), patch(
-            "api.gateway_chat._run_gateway_runs_api_streaming",
+        ), patch("api.gateway_transport.gateway_supports_approval", return_value=True), patch(
+            "api.gateway_transport_runs._run_gateway_runs_api_streaming",
             side_effect=disconnect_after_run_id,
         ), patch("api.gateway_chat.get_session", return_value=session):
             gateway_chat._run_gateway_chat_streaming(
@@ -558,7 +559,8 @@ def test_gateway_approval_event_translation():
 def test_gateway_runs_api_streaming_parses_real_run_events():
     """The runs-API bridge must parse the real gateway event payloads."""
     from api.config import STREAM_PARTIAL_TEXT, STREAM_REASONING_TEXT
-    from api.gateway_chat import _STREAM_RUN_IDS, _run_gateway_runs_api_streaming
+    from api.gateway_chat import _STREAM_RUN_IDS
+    from api.gateway_transport_runs import _run_gateway_runs_api_streaming
 
     events = []
     requests = []
@@ -656,7 +658,8 @@ def test_gateway_runs_api_streaming_parses_real_run_events():
 def test_gateway_runs_api_streaming_same_run_fifo_emits_head_and_promotes_successor():
     """Runs API approval events publish the reconciled FIFO head and count."""
     from api.config import STREAM_PARTIAL_TEXT, STREAM_REASONING_TEXT
-    from api.gateway_chat import _STREAM_RUN_IDS, _run_gateway_runs_api_streaming
+    from api.gateway_chat import _STREAM_RUN_IDS
+    from api.gateway_transport_runs import _run_gateway_runs_api_streaming
     from api import routes
     import api.route_approvals as approvals
 
@@ -764,7 +767,7 @@ def test_gateway_runs_api_streaming_same_run_fifo_emits_head_and_promotes_succes
 
 def test_in_process_runs_approval_reaches_real_response_lifecycle():
     """Runs API empty IDs are carried and resolved through the live mirror."""
-    from api.gateway_chat import _run_gateway_runs_api_streaming
+    from api.gateway_transport_runs import _run_gateway_runs_api_streaming
     import api.route_approvals as approvals
     import api.routes as routes
 
@@ -1496,7 +1499,8 @@ def test_local_stop_uses_runs_api_stop_endpoint():
 
 
 def test_runs_api_publishes_run_id_before_events():
-    from api.gateway_chat import _STREAM_RUN_IDS, _run_gateway_runs_api_streaming
+    from api.gateway_chat import _STREAM_RUN_IDS
+    from api.gateway_transport_runs import _run_gateway_runs_api_streaming
 
     stream_id = "sid-run-create-cancel"
     cancel_event = threading.Event()
@@ -1563,7 +1567,8 @@ def test_runs_api_publishes_run_id_before_events():
 
 
 def test_runs_api_does_not_own_pre_stream_stop_after_publication():
-    from api.gateway_chat import _STREAM_RUN_IDS, _run_gateway_runs_api_streaming
+    from api.gateway_chat import _STREAM_RUN_IDS
+    from api.gateway_transport_runs import _run_gateway_runs_api_streaming
 
     stream_id = "sid-run-create-cancel-stop-failed"
     cancel_event = threading.Event()
@@ -1636,9 +1641,9 @@ def test_runs_api_does_not_own_pre_stream_stop_after_publication():
 def test_runs_api_marks_run_pending_before_request_preparation():
     from api.gateway_chat import (
         _mark_gateway_run_starting,
-        _run_gateway_runs_api_streaming,
         gateway_run_id_pending,
     )
+    from api.gateway_transport_runs import _run_gateway_runs_api_streaming
 
     stream_id = "sid-run-starting-prep"
     cancel_event = threading.Event()
@@ -1752,9 +1757,9 @@ def test_gateway_worker_marks_run_pending_before_runs_api_prelude():
              patch("api.gateway_chat._gateway_base_url", return_value="http://gw:8642"), \
              patch("api.gateway_chat._gateway_api_key", return_value=""), \
              patch("api.gateway_chat._gateway_use_runs_api_enabled", return_value=True), \
-             patch("api.gateway_chat.gateway_supports_approval", side_effect=fake_supports), \
+             patch("api.gateway_transport.gateway_supports_approval", side_effect=fake_supports), \
              patch("api.gateway_chat._gateway_reasoning_effort_for_request", return_value=None), \
-             patch("api.gateway_chat._run_gateway_runs_api_streaming", side_effect=fake_runs), \
+             patch("api.gateway_transport_runs._run_gateway_runs_api_streaming", side_effect=fake_runs), \
              patch("api.streaming._load_webui_prefill_context", return_value={}), \
              patch("api.streaming._prefill_messages_with_webui_context", return_value=[]), \
              patch("api.streaming._normalize_prefill_messages_before_user_turn", side_effect=lambda messages: messages), \
@@ -2007,9 +2012,9 @@ def test_chat_cancel_waits_for_worker_published_run_id_before_settlement(
              patch("api.gateway_chat._gateway_base_url", return_value="http://gw:8642"), \
              patch("api.gateway_chat._gateway_api_key", return_value=""), \
              patch("api.gateway_chat._gateway_use_runs_api_enabled", return_value=True), \
-             patch("api.gateway_chat.gateway_supports_approval", side_effect=fake_supports), \
+             patch("api.gateway_transport.gateway_supports_approval", side_effect=fake_supports), \
              patch("api.gateway_chat._gateway_reasoning_effort_for_request", return_value=None), \
-             patch("api.gateway_chat._run_gateway_runs_api_streaming", side_effect=fake_runs), \
+             patch("api.gateway_transport_runs._run_gateway_runs_api_streaming", side_effect=fake_runs), \
              patch("api.streaming._load_webui_prefill_context", return_value={}), \
              patch("api.streaming._prefill_messages_with_webui_context", return_value=[]), \
              patch("api.streaming._normalize_prefill_messages_before_user_turn", side_effect=lambda messages: messages), \
@@ -2876,7 +2881,8 @@ def test_token_stale_same_run_gateway_card_does_not_relay_advanced_live_head():
 
 def test_gateway_runs_api_streaming_preserves_multimodal_input():
     """Attachment-backed runs requests must keep multimodal content lists."""
-    from api.gateway_chat import _STREAM_RUN_IDS, _run_gateway_runs_api_streaming
+    from api.gateway_chat import _STREAM_RUN_IDS
+    from api.gateway_transport_runs import _run_gateway_runs_api_streaming
 
     requests = []
     multimodal_content = [
@@ -2978,8 +2984,8 @@ def test_gateway_runs_api_cancel_does_not_emit_empty_response():
 
     try:
         with patch.dict("os.environ", {"HERMES_WEBUI_CHAT_BACKEND": "gateway", "HERMES_WEBUI_GATEWAY_USE_RUNS_API": "1"}):
-            with patch("api.gateway_chat.gateway_supports_approval", return_value=True), \
-                 patch("api.gateway_chat._run_gateway_runs_api_streaming", side_effect=fake_runs_streaming), \
+            with patch("api.gateway_transport.gateway_supports_approval", return_value=True), \
+                 patch("api.gateway_transport_runs._run_gateway_runs_api_streaming", side_effect=fake_runs_streaming), \
                  patch("api.gateway_chat.get_session", return_value=mock_session):
                 _run_gateway_chat_streaming(
                     session_id="sess-cancel",
@@ -3563,7 +3569,7 @@ def test_gateway_empty_response_no_approval_banner():
 
     try:
         with patch.dict("os.environ", {"HERMES_WEBUI_CHAT_BACKEND": "gateway"}):
-            with patch("api.gateway_chat.gateway_supports_approval", return_value=False), \
+            with patch("api.gateway_transport.gateway_supports_approval", return_value=False), \
                  patch("urllib.request.urlopen", side_effect=fake_urlopen), \
                  patch("api.gateway_chat.get_session", return_value=MagicMock(
                      active_stream_id=stream_id, workspace="/tmp",
@@ -3638,7 +3644,7 @@ def test_gateway_chat_completions_path_unchanged():
 
     try:
         with patch.dict("os.environ", {"HERMES_WEBUI_CHAT_BACKEND": "gateway"}):
-            with patch("api.gateway_chat.gateway_supports_approval", return_value=False), \
+            with patch("api.gateway_transport.gateway_supports_approval", return_value=False), \
                  patch("urllib.request.urlopen", side_effect=fake_urlopen), \
                  patch("api.gateway_chat.get_session", return_value=mock_session), \
                  patch("api.gateway_chat._stream_writeback_is_current", return_value=True), \

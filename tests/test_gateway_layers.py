@@ -32,6 +32,7 @@ from api.gateway_events import (
 )
 from api.gateway_projection import GatewayEventProjector, LiveTurnSnapshot, TurnCheckpoint
 from api.gateway_sse import SseFrame, iter_sse_frames
+from api import gateway_transport_runs as gateway_runs
 
 STREAM = "layers-stream"
 
@@ -258,7 +259,7 @@ def test_relay_updates_the_checkpoint_in_place_when_the_connection_dies(register
 
     checkpoint = TurnCheckpoint(registered_stream, text="")
     with pytest.raises(ConnectionResetError):
-        gateway_chat._relay_gateway_run_events(
+        gateway_runs._relay_gateway_run_events(
             dying(), "sid", registered_stream, "run", "http://x", "",
             put_gateway_event=lambda e, d: None, cancel_event=threading.Event(), checkpoint=checkpoint,
         )

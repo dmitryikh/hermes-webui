@@ -16,6 +16,8 @@ import pytest
 
 import api.config as config
 import api.gateway_chat as gateway_chat
+from api import gateway_transport_chat as gateway_chat_transport
+from api import gateway_transport
 import api.models as models
 import api.routes as routes
 from api import profiles
@@ -515,8 +517,8 @@ def _run_gateway_turn(session, stream_id, tmp_path, monkeypatch, *, runs_api, ht
     events = channel.subscribe()
     monkeypatch.setitem(config.STREAMS, stream_id, channel)
     monkeypatch.setenv("HERMES_WEBUI_GATEWAY_USE_RUNS_API", "1" if runs_api else "0")
-    monkeypatch.setattr(gateway_chat, "gateway_supports_approval", lambda *a: True)
-    monkeypatch.setattr(gateway_chat, "gateway_approval_unavailable_reason", lambda *a: None)
+    monkeypatch.setattr(gateway_transport, "gateway_supports_approval", lambda *a: True)
+    monkeypatch.setattr(gateway_chat_transport, "gateway_approval_unavailable_reason", lambda *a: None)
     # Avoid external platform discovery in system-prompt preparation.
     monkeypatch.setattr("api.streaming._load_webui_prefill_context", lambda cfg: {})
     monkeypatch.setattr("api.streaming._webui_ephemeral_system_prompt", lambda *a, **k: "test")

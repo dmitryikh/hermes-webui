@@ -20,10 +20,8 @@ import pytest
 
 import api.route_approvals as approvals
 from api import routes
-from api.gateway_chat import (
-    _gateway_runs_approval_event,
-    _relay_gateway_run_approval,
-)
+from api.gateway_chat import _gateway_runs_approval_event
+from api.gateway_transport_runs import _relay_gateway_run_approval
 from api.runner_client import HttpRunnerClient
 
 SID = "sess-generation-approval"
