@@ -176,9 +176,10 @@ def test_lost_ack_then_connection_failure_keeps_original_admission(protocol, mon
 
 @pytest.mark.parametrize("is_error", [True, False])
 def test_canonical_tool_verdict_reaches_event_and_reconnect_snapshot(monkeypatch, is_error):
-    from api import gateway_chat
+    from api.gateway_projection import LiveTurnSnapshot
     snapshots = []
-    monkeypatch.setattr(gateway_chat, "_note_live_gateway_event", lambda *args: snapshots.append(args))
+    monkeypatch.setattr(LiveTurnSnapshot, "note_tool",
+                        lambda self, name, payload: snapshots.append((self.stream_id, name, payload)))
     instance, events, _ = relay()
     instance.receipt = {"admission_id": "mine"}
     instance.event({"session_id": instance.session_id, "admission_id": "mine", "type": "tool.complete",
@@ -207,8 +208,6 @@ def test_clarification_control_matches_canonical_parameter_shape(monkeypatch, ba
 
 
 def test_only_own_admission_is_relayed_and_replayed_deltas_are_deduplicated(monkeypatch):
-    from api import gateway_chat
-    monkeypatch.setattr(gateway_chat, "_append_gateway_stream_text", lambda _, old, delta: old + delta)
     instance, events, _ = relay()
     instance.receipt = {"admission_id": "mine"}
     def frame(seq, owner, text):

@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 from api import gateway_chat as g, config, models, run_journal
+from api.gateway_projection import LiveTurnSnapshot
 import pytest
 from unittest.mock import MagicMock
 
@@ -76,9 +77,9 @@ def test_success_writeback_keeps_commentary_outside_model_context(monkeypatch, t
         assert [m['content'] for m in saved['context_messages']] == ['question','Final.']
         rows = run_journal.read_run_events('sid','stream')['events']
         assert len([row for row in rows if row['event'] == 'interim_assistant']) == 2
-        g.STREAM_PARTIAL_TEXT['stream'] = ''
-        assert g._restore_relayed_gateway_state('sid','stream') == 4
-        assert g.STREAM_PARTIAL_TEXT['stream'] == 'Final.'
+        config.STREAM_PARTIAL_TEXT['stream'] = ''
+        assert LiveTurnSnapshot.restore('sid','stream') == 4
+        assert config.STREAM_PARTIAL_TEXT['stream'] == 'Final.'
 
 @pytest.mark.parametrize('terminal', ['failed', 'cancelled'])
 @pytest.mark.parametrize('already_streamed', [False, True])
@@ -178,7 +179,7 @@ def test_terminal_writeback_retains_sealed_commentary(monkeypatch, tmp_path, ter
     # The next real runs-admission body must also exclude sealed commentary.
     reloaded.active_stream_id = 'next-stream'
     reloaded.pending_user_message = 'next question'
-    monkeypatch.setitem(g.STREAM_PARTIAL_TEXT, 'next-stream', '')
+    monkeypatch.setitem(config.STREAM_PARTIAL_TEXT, 'next-stream', '')
     frames[:] = [frame('run.completed', 1, output='Next answer.')]
     g._run_gateway_runs_api_streaming(
         'sid', 'next question', 'model', str(ROOT), 'next-stream',
@@ -202,12 +203,12 @@ def test_terminal_writeback_retains_sealed_commentary(monkeypatch, tmp_path, ter
 def test_invalid_interim_does_not_reset_answer(text):
     result, events, seqs = relay([frame('message.delta',1,delta='Final'),frame('message.interim',2,text=text),frame('run.completed',3,output='Final')])
     assert [e for e,d in events] == ['token']
-    assert result[0] == g.STREAM_PARTIAL_TEXT['stream'] == 'Final'
+    assert result[0] == config.STREAM_PARTIAL_TEXT['stream'] == 'Final'
     assert seqs == [1,2,3]
 
 def test_interim_without_cursor_fails_closed_to_status_polling(monkeypatch):
     monkeypatch.setattr(run_journal,'read_run_events',lambda *a,**k:{'events':[{'event':'interim_assistant','payload':{'text':'Checking'}}]})
-    assert g._restore_relayed_gateway_state('sid','stream') is None
+    assert LiveTurnSnapshot.restore('sid','stream') is None
 
 def test_journal_commentary_recovery_is_idempotent_and_final_free(monkeypatch):
     rows = [
@@ -238,12 +239,11 @@ def test_sealed_tool_keeps_later_completion(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def isolation(monkeypatch, tmp_path):
-    monkeypatch.setattr(g, '_iter_sse_lines_cancellable', lambda resp, cancel: iter(resp))
     monkeypatch.setattr('api.route_approvals.settle_gateway_pending_run', lambda *a, **k: None)
     monkeypatch.setattr(g, 'update_active_run', lambda *a, **k: None)
-    monkeypatch.setitem(g.STREAM_PARTIAL_TEXT, 'stream', '')
-    monkeypatch.setitem(g.STREAM_REASONING_TEXT, 'stream', '')
-    monkeypatch.setitem(g.STREAM_LIVE_TOOL_CALLS, 'stream', [])
+    monkeypatch.setitem(config.STREAM_PARTIAL_TEXT, 'stream', '')
+    monkeypatch.setitem(config.STREAM_REASONING_TEXT, 'stream', '')
+    monkeypatch.setitem(config.STREAM_LIVE_TOOL_CALLS, 'stream', [])
 
 def frame(event, seq, **data):
     return ('data: ' + json.dumps(dict(event=event, seq=seq, **data))).encode()
@@ -264,7 +264,7 @@ def test_live_interim_order_and_final_separation():
     ])
     assert events[0] == ('interim_assistant', {'text':'Checking files.', 'already_streamed':False, 'gateway_seq':1})
     assert [e for e,d in events] == ['interim_assistant','tool','token']
-    assert result[0] == g.STREAM_PARTIAL_TEXT['stream'] == 'Final answer.'
+    assert result[0] == config.STREAM_PARTIAL_TEXT['stream'] == 'Final answer.'
     assert seqs == [1,2,3,4]
 
 def test_streamed_interim_seals_tokens_without_repeating_final():
@@ -275,7 +275,7 @@ def test_streamed_interim_seals_tokens_without_repeating_final():
         frame('run.completed', 4, output='Answer.'),
     ])
     assert events[1] == ('interim_assistant', {'text':'Checking files.', 'already_streamed':True, 'gateway_seq':2})
-    assert result[0] == g.STREAM_PARTIAL_TEXT['stream'] == 'Answer.'
+    assert result[0] == config.STREAM_PARTIAL_TEXT['stream'] == 'Answer.'
 
 @pytest.mark.parametrize('sealed_reasoning,open_reasoning', [
     ('Sealed thought.', ''), ('Sealed thought.', 'Later thought.'),
@@ -290,9 +290,9 @@ def test_restart_restores_only_open_answer_segment(monkeypatch, sealed_reasoning
         {'event':'reasoning','payload':{'text':open_reasoning,'gateway_seq':4}},
     ]
     monkeypatch.setattr(run_journal, 'read_run_events', lambda *a,**k: {'events':rows})
-    assert g._restore_relayed_gateway_state('sid','stream') == 4
-    assert g.STREAM_PARTIAL_TEXT['stream'] == 'Ans'
-    assert g.STREAM_REASONING_TEXT['stream'] == open_reasoning
-    result, events, seqs = relay([frame('message.delta',5,delta='wer.'),frame('run.completed',6,output='Answer.')],final_text=g._seed_gateway_stream_text('stream'))
-    assert result[0] == g.STREAM_PARTIAL_TEXT['stream'] == 'Answer.'
+    assert LiveTurnSnapshot.restore('sid','stream') == 4
+    assert config.STREAM_PARTIAL_TEXT['stream'] == 'Ans'
+    assert config.STREAM_REASONING_TEXT['stream'] == open_reasoning
+    result, events, seqs = relay([frame('message.delta',5,delta='wer.'),frame('run.completed',6,output='Answer.')],final_text=LiveTurnSnapshot('stream').text)
+    assert result[0] == config.STREAM_PARTIAL_TEXT['stream'] == 'Answer.'
     assert [d['text'] for e,d in events if e == 'token'] == ['wer.']

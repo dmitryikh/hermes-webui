@@ -17,17 +17,31 @@ from api.config import PENDING_GOAL_CONTINUATION, STREAMS, create_stream_channel
 from api.models import new_session
 from api.gateway_chat import (
     _gateway_http_error_event,
-    _gateway_reasoning_delta,
-    _gateway_sse_delta,
-    _gateway_sse_reasoning_delta,
-    _gateway_stream_usage,
-    _gateway_tool_progress_event,
     _gateway_use_runs_api_enabled,
     gateway_chat_config_status,
     webui_chat_backend_mode,
     webui_gateway_chat_enabled,
 )
 from api.turn_journal import derive_turn_journal_states, read_turn_journal
+from api.gateway_events import (
+    ReasoningDelta,
+    chunk_reasoning_delta as _gateway_sse_reasoning_delta,
+    chunk_text_delta as _gateway_sse_delta,
+    decode_tool_progress,
+    payload_usage as _gateway_stream_usage,
+    reasoning_text as _gateway_reasoning_delta,
+)
+from api.gateway_projection import tool_event
+
+
+def _gateway_tool_progress_event(payload):
+    """Decode (layer 2) then project (layer 3) one tool-progress payload to its WebUI event."""
+    decoded = decode_tool_progress(payload)
+    if decoded is None:
+        return None
+    if isinstance(decoded, ReasoningDelta):
+        return "reasoning", {"text": decoded.text}
+    return tool_event(decoded)
 
 
 def test_gateway_chat_backend_is_default_off_for_truthy_values():

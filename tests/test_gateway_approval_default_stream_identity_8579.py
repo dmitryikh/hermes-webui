@@ -361,9 +361,8 @@ class TestSharedIdentityDecision:
         assert "_gateway_raw_approval_id_present" not in relay_body, (
             "the relay must not re-derive the identity predicate inline"
         )
-        stream_marker = 'if _payload_event in {"hermes.approval.request", "approval.request"}:'
-        assert stream_marker in src
-        stream_body = src[src.index(stream_marker):]
+        stream_start = src.index("def _relay_chat_completion_approval(")
+        stream_body = src[stream_start:src.index("\ndef ", stream_start + 10)]
         assert "_gateway_approval_identity_v1(" in stream_body, (
             "the default chat-completions stream must delegate to the shared identity helper"
         )

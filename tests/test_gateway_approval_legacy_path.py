@@ -13,6 +13,8 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from api.gateway_chat import _gateway_runs_approval_event
+from api.gateway_events import ApprovalRequest, decode_chat_completion_frame
+from api.gateway_sse import iter_sse_frames
 
 REPO_ROOT = Path(__file__).parent.parent
 GATEWAY_CHAT_SRC = (REPO_ROOT / "api" / "gateway_chat.py").read_text(encoding="utf-8")
@@ -66,71 +68,82 @@ def _make_legacy_gateway_urlopen(approval_payload: str, after_approval=None):
     return fake_urlopen
 
 
-def test_legacy_loop_checks_approval_request_event():
-    """Legacy SSE loop must handle `approval.request` events."""
-    loop = _extract_legacy_sse_loop()
-    assert '"approval.request"' in loop, (
-        "Legacy SSE loop must check for approval.request event name"
+def _decode_lines(*lines):
+    """Frame (layer 1) and decode (layer 2) raw lines of the /v1/chat/completions stream."""
+    frames = [decode_chat_completion_frame(frame) for frame in iter_sse_frames(lines)]
+    return [frame for frame in frames if frame is not None]
+
+
+@pytest.mark.parametrize("name", ["approval.request", "hermes.approval.request"])
+def test_legacy_decoder_recognizes_approval_from_sse_event_name(name):
+    """Both approval event names announced by the SSE ``event:`` field are approvals."""
+    payload = {"command": "rm -rf /tmp/x", "approval_id": "a1"}
+    (frame,) = _decode_lines(f"event: {name}".encode(), f"data: {json.dumps(payload)}".encode())
+    assert frame.events == (ApprovalRequest(payload),)
+
+
+@pytest.mark.parametrize("field", ["event", "type"])
+@pytest.mark.parametrize("name", ["approval.request", "hermes.approval.request"])
+def test_legacy_decoder_derives_approval_from_payload(field, name):
+    """The JSON ``event``/``type`` field names an approval without an SSE ``event:`` line."""
+    payload = {field: name, "command": "rm -rf /tmp/x"}
+    (frame,) = _decode_lines(f"data: {json.dumps(payload)}".encode())
+    assert frame.events == (ApprovalRequest(payload),)
+
+
+def test_legacy_decoder_approval_event_name_does_not_bleed():
+    """The SSE event name resets after the approval frame, so it cannot bleed into the next payload."""
+    tool_like = {"tool": "terminal", "status": "running"}
+    frames = _decode_lines(
+        b"event: hermes.approval.request",
+        b'data: {"command": "rm -rf /tmp/x"}',
+        f"data: {json.dumps(tool_like)}".encode(),
     )
+    assert isinstance(frames[0].events[0], ApprovalRequest)
+    assert frames[1].events == ()
 
 
-def test_legacy_loop_checks_hermes_approval_request_event():
-    """Legacy SSE loop must handle `hermes.approval.request` events."""
-    loop = _extract_legacy_sse_loop()
-    assert '"hermes.approval.request"' in loop, (
-        "Legacy SSE loop must check for hermes.approval.request event name"
-    )
+def test_legacy_loop_dispatches_approvals_to_the_card_relay():
+    """The /v1/chat/completions loop hands decoded approvals to the shared card relay."""
+    start = GATEWAY_CHAT_SRC.find(_LEGACY_MARKER)
+    assert start >= 0, "Legacy chat/completions path not found in gateway_chat.py"
+    loop = GATEWAY_CHAT_SRC[start:GATEWAY_CHAT_SRC.find(_NEXT_FUNC_RE, start)]
+    assert "decode_chat_completion_frame(" in loop
+    assert "_relay_chat_completion_approval(" in loop
 
 
-def test_legacy_loop_derives_event_from_payload():
-    """Legacy SSE loop must derive event type from JSON payload fields."""
-    loop = _extract_legacy_sse_loop()
-    assert 'payload.get("event")' in loop or "payload.get('event')" in loop, (
-        "Legacy SSE loop must check payload JSON 'event' field"
-    )
+def test_legacy_card_relay_maps_mirrors_and_emits_the_approval():
+    """The card relay maps with _gateway_runs_approval_event, mirrors for polling, then emits the card."""
+    from api import gateway_chat
 
+    events, mirrored = [], []
 
-def test_legacy_loop_calls_put_gateway_event_approval():
-    """Legacy SSE loop must relay approval via put_gateway_event('approval', ...)."""
-    loop = _extract_legacy_sse_loop()
-    assert 'put_gateway_event("approval"' in loop, (
-        "Legacy SSE loop must call put_gateway_event with 'approval' event type"
-    )
+    def mirror(session_id, approval_data, cancel_event):
+        mirrored.append((session_id, approval_data["approval_id"]))
+        return {**approval_data, "mirrored": True}, 2
 
-
-def test_legacy_loop_calls_submit_gateway_pending_mirror():
-    """Legacy SSE loop must mirror approval to polling state."""
-    loop = _extract_legacy_sse_loop()
-    assert "submit_gateway_pending_mirror" in loop, (
-        "Legacy SSE loop must call submit_gateway_pending_mirror for polling fallback"
-    )
-
-
-def test_legacy_loop_reuses_gateway_runs_approval_event():
-    """Legacy SSE loop must reuse _gateway_runs_approval_event, not duplicate the mapping."""
-    loop = _extract_legacy_sse_loop()
-    assert "_gateway_runs_approval_event" in loop, (
-        "Legacy SSE loop must call _gateway_runs_approval_event to map the payload"
-    )
-
-
-def test_legacy_loop_resets_sse_event_after_approval():
-    """Legacy SSE loop must reset sse_event to 'message' after handling approval."""
-    loop = _extract_legacy_sse_loop()
-    approval_idx = loop.find('"hermes.approval.request"')
-    assert approval_idx >= 0
-    # Window sized to cover the whole approval handling block: the run_id
-    # recording (#4549 follow-up) and the creation-time identity decision
-    # (#8579) both live inside it, and the reset must still land before the
-    # next event branch so an approval cannot bleed into tool progress.
-    block_after = loop[approval_idx:approval_idx + 2600]
-    assert 'sse_event = "message"' in block_after, (
-        "Must reset sse_event to 'message' after approval handling to prevent bleed"
-    )
-    # The reset must be the approval branch's own, not a later branch's.
-    assert block_after.index('sse_event = "message"') < block_after.find(
-        'if sse_event == "hermes.tool.progress":'
-    ), "the approval branch must reset sse_event before the next event branch"
+    with patch.object(gateway_chat, "_submit_stream_approval_mirror", side_effect=mirror), \
+            patch("api.config.gateway_supports_approval_identity_v1", return_value=False):
+        relayed = gateway_chat._relay_chat_completion_approval(
+            "sid-legacy", "stream-legacy",
+            {"command": "rm -rf /tmp/x", "approval_id": "a1", "run_id": "run-legacy"},
+            "http://gateway.test", "",
+            cancel_event=threading.Event(), put_gateway_event=lambda e, d: events.append((e, d)),
+        )
+        assert gateway_chat._relay_chat_completion_approval(
+            "sid-legacy", "stream-legacy", {"risk_level": "high"}, "http://gateway.test", "",
+            cancel_event=threading.Event(), put_gateway_event=lambda e, d: events.append((e, d)),
+        ) is False
+    try:
+        assert relayed is True
+        assert mirrored == [("sid-legacy", "a1")]
+        assert [e for e, _ in events] == ["approval"]
+        card = events[0][1]
+        assert card["mirrored"] is True and card["pending_count"] == 2
+        assert card["_gateway_agent_identity_v1"] is False
+        assert gateway_chat._STREAM_RUN_IDS["stream-legacy"] == "run-legacy"
+    finally:
+        gateway_chat._STREAM_RUN_IDS.pop("stream-legacy", None)
 
 
 def test_approval_event_mapping_complete_payload():

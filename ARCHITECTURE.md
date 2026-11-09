@@ -59,6 +59,12 @@ actions. The topbar remains focused on conversation context and the workspace/fi
       agent_compat.py      Resolver for Hermes Agent names moved to sibling modules (compatibility-only)
       auth.py              Optional password authentication, signed cookies, passkeys/WebAuthn
       config.py            Discovery, globals, model detection, reloadable config
+      gateway_sse.py       Gateway bridge layer 1: SSE line framing, read-timeout budget, Stop-aware reads
+      gateway_events.py    Gateway bridge layer 2: typed Hermes events + one decoder per wire dialect
+      gateway_projection.py Gateway bridge layer 3: Gateway events -> WebUI events + live reconnect snapshot
+      gateway_chat.py      Gateway bridge orchestration: request build, admission, reconnect/watchdog,
+                           durable run status, approvals, terminal settlement and persistence
+      gateway_sessions.py  Canonical session-protocol transport (JSON-RPC lane of the Gateway bridge)
       helpers.py           HTTP helpers: j(), bad(), require(), safe_resolve(), security headers
       goals.py             Persistent-goal commands and profile-scoped native GoalManager bridge
       models.py            Session model + CRUD, per-session profile/model/reasoning tracking, CLI/state.db bridge
@@ -397,6 +403,35 @@ on_tool callback:
 
 The approval surface-on-tool logic means approvals appear immediately after the tool
 fires (within the same SSE stream), without waiting for the next poll cycle.
+
+#### Gateway-backed turns (`HERMES_WEBUI_CHAT_BACKEND=gateway`)
+
+A Gateway-backed turn keeps the same browser contract, but its events come from
+the Hermes Gateway. Each processing level lives in its own module and talks to
+the next level only through its output type:
+
+    HTTP response bytes
+      -> api/gateway_sse.py         iter_sse_frames()         -> SseFrame(event, data)
+      -> api/gateway_events.py      decode_runs_frame()        -> GatewayFrame(seq, events)
+                                    decode_chat_completion_frame()
+                                    decode_session_event()     (JSON-RPC session lane)
+      -> api/gateway_projection.py  GatewayEventProjector      -> WebUI event (journaled
+                                                                  + queued) and
+                                                                  LiveTurnSnapshot update
+      -> api/gateway_chat.py        run orchestration: reconnect, watchdog, durable
+                                    run status, approvals, terminal settlement
+
+- Layer 1 knows SSE grammar and read timeouts only; layer 2 is pure decoding
+  into typed events (`TextDelta`, `ReasoningDelta`, `ToolProgress`,
+  `InterimMessage`, `ApprovalRequest`, `UsageReport`, `RunCompleted`, ...);
+  layer 3 owns the stream's reconnect snapshot rows
+  (`STREAM_PARTIAL_TEXT`, `STREAM_REASONING_TEXT`, `STREAM_LIVE_TOOL_CALLS`).
+- Control events (approvals, terminal run events, replay truncation) are not
+  projected: their side effects are orchestration and stay in `gateway_chat.py`.
+- Invariant: every snapshot update comes from the same projection that emits
+  the journaled WebUI event, so the snapshot is the fold of the journal.
+  `LiveTurnSnapshot.restore()` rebuilds it after a WebUI restart by folding
+  the journal with the same `LiveTurnSnapshot.apply()`.
 
 ### 4.5 Approval System Integration
 

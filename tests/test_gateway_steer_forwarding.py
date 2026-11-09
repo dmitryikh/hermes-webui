@@ -178,15 +178,27 @@ def test_uncertain_steer_keeps_the_draft_in_the_browser():
 
 
 @pytest.mark.parametrize("event", ["run.completed", "run.failed", "run.cancelled"])
-def test_live_relay_replays_unconsumed_gateway_steer(event):
+def test_live_relay_replays_unconsumed_gateway_steer(monkeypatch, event):
     events = []
     gateway_chat._relay_gateway_pending_steer(
         "sid", {"event": event, "pending_steer": "go left"}, lambda e, d: events.append((e, d)))
     gateway_chat._relay_gateway_pending_steer("sid", {"event": event}, lambda e, d: events.append((e, d)))
     assert events == [("pending_steer_leftover", {"session_id": "sid", "text": "go left"})]
-    src = __import__("inspect").getsource(gateway_chat._relay_gateway_run_events)
-    block = src[src.index(f'if payload_event == "{event}":'):]
-    assert block.split("\n")[1].strip() == "_relay_gateway_pending_steer(session_id, payload, put_gateway_event)"
+
+    # The live relay replays the leftover first on every terminal frame,
+    # before it settles approvals and before the terminal outcome is surfaced.
+    calls = []
+    monkeypatch.setattr("api.route_approvals.settle_gateway_pending_run",
+                        lambda *a, **k: calls.append(("settle", None)))
+    frame = ("data: " + json.dumps({"event": event, "seq": 1, "output": "ok", "pending_steer": "go left"})).encode()
+    try:
+        gateway_chat._relay_gateway_run_events(
+            [frame], "sid", "relay-steer", "run", "http://x", "",
+            put_gateway_event=lambda e, d: calls.append((e, d)), cancel_event=threading.Event())
+    except RuntimeError:
+        assert event == "run.failed"
+    assert calls[0] == ("pending_steer_leftover", {"session_id": "sid", "text": "go left"})
+    assert calls[1] == ("settle", None)
 
 
 @pytest.mark.parametrize("state", ["completed", "failed", "cancelled"])

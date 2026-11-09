@@ -153,6 +153,7 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import api.config as _config  # noqa: E402
 import api.gateway_chat as gc  # noqa: E402
 from api.gateway_chat import GATEWAY_REATTACH_MAX_POLL_FAILURES, GATEWAY_REATTACH_POLL_INTERVAL  # noqa: E402
 
@@ -443,7 +444,7 @@ def run_turn(*, urlopen_script=(), status_script=(), cancel_event=None, clock=No
 
     patch(ra, "settle_gateway_pending_run", fake_settle)
 
-    gc.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
+    _config.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
     saved_log_level = gc.logger.level
     gc.logger.setLevel(logging.CRITICAL)
     try:
@@ -461,7 +462,7 @@ def run_turn(*, urlopen_script=(), status_script=(), cancel_event=None, clock=No
         gc.logger.setLevel(saved_log_level)
         for obj, name, value in reversed(saved):
             setattr(obj, name, value)
-        gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+        _config.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
     return {
         "result": result,
         "events": events,
@@ -798,7 +799,7 @@ def test_stop_between_grace_probes_surfaces_cancel_without_reconnect():
     import api.route_approvals as ra
 
     patch(ra, "settle_gateway_pending_run", lambda *a, **k: (0, None, 0))
-    gc.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
+    _config.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
     try:
         result = gc._run_gateway_runs_api_streaming(
             "sess-watchdog-harness", "hi", "test-model", "/tmp", STREAM_ID,
@@ -809,7 +810,7 @@ def test_stop_between_grace_probes_surfaces_cancel_without_reconnect():
     finally:
         for obj, name, value in reversed(saved):
             setattr(obj, name, value)
-        gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+        _config.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
 
     assert result[0] is None, f"Stop between the probes must cancel, got {result!r}"
     assert any(name == "cancel" for name, _ in events), f"events={events!r}"
@@ -1524,9 +1525,9 @@ def test_r4_cancel_marker_scan_stops_at_turn_boundary():
     models.SESSION_DIR = pathlib.Path(tmp)
     models.SESSION_INDEX_FILE = pathlib.Path(tmp) / "_index.json"
     models.SESSIONS.clear()
-    saved_partial = gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
-    saved_reasoning = gc.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
-    saved_tools = gc.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
+    saved_partial = _config.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+    saved_reasoning = _config.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
+    saved_tools = _config.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
     try:
         sid = "sess-watchdog-marker-boundary"
         session = models.Session(session_id=sid, title="Watchdog Harness", messages=[
@@ -1542,9 +1543,9 @@ def test_r4_cancel_marker_scan_stops_at_turn_boundary():
         session.save()
         models.SESSIONS[sid] = session
 
-        gc.STREAM_PARTIAL_TEXT[STREAM_ID] = "second partial answer"
-        gc.STREAM_REASONING_TEXT[STREAM_ID] = ""
-        gc.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = []
+        _config.STREAM_PARTIAL_TEXT[STREAM_ID] = "second partial answer"
+        _config.STREAM_REASONING_TEXT[STREAM_ID] = ""
+        _config.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = []
         gc._settle_gateway_cancelled_turn(sid, STREAM_ID)
 
         models.SESSIONS.pop(sid, None)
@@ -1563,15 +1564,15 @@ def test_r4_cancel_marker_scan_stops_at_turn_boundary():
         assert rows[3]["content"] == "second prompt", rows[3]
         assert rows[4]["content"] == "second partial answer", rows[4]
     finally:
-        gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
-        gc.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
-        gc.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
+        _config.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+        _config.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
+        _config.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
         if saved_partial is not None:
-            gc.STREAM_PARTIAL_TEXT[STREAM_ID] = saved_partial
+            _config.STREAM_PARTIAL_TEXT[STREAM_ID] = saved_partial
         if saved_reasoning is not None:
-            gc.STREAM_REASONING_TEXT[STREAM_ID] = saved_reasoning
+            _config.STREAM_REASONING_TEXT[STREAM_ID] = saved_reasoning
         if saved_tools is not None:
-            gc.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = saved_tools
+            _config.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = saved_tools
         models.SESSION_DIR, models.SESSION_INDEX_FILE = saved_dir, saved_index
         models.SESSIONS.clear()
         models.SESSIONS.update(saved_sessions)
@@ -1642,9 +1643,9 @@ def test_r4_status_lane_cancel_persists_before_cancel_event():
         import api.route_approvals as ra
 
         patch(ra, "settle_gateway_pending_run", lambda *a, **k: (0, None, 0))
-        gc.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
-        gc.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
-        gc.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
+        _config.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
+        _config.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
+        _config.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
         try:
             result = gc._run_gateway_runs_api_streaming(
                 sid, "hi", "test-model", "/tmp", STREAM_ID,
@@ -1655,7 +1656,7 @@ def test_r4_status_lane_cancel_persists_before_cancel_event():
         finally:
             for obj, name, value in reversed(saved):
                 setattr(obj, name, value)
-            gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+            _config.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
 
         assert result[0] is None, result
         assert refetch_at_event and refetch_at_event[0] == (1, "partial answer so far"), (
@@ -1670,9 +1671,9 @@ def test_r4_status_lane_cancel_persists_before_cancel_event():
         assert len(partials) == 1 and partials[0].get("content") == "partial answer so far", partials
         assert len(markers) == 1, markers
     finally:
-        gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
-        gc.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
-        gc.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
+        _config.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+        _config.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
+        _config.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
         models.SESSION_DIR, models.SESSION_INDEX_FILE = saved_dir, saved_index
         models.SESSIONS.clear()
         models.SESSIONS.update(saved_sessions)
@@ -1749,7 +1750,7 @@ def test_stop_is_honoured_between_probe_retries():
     import api.route_approvals as ra
 
     patch(ra, "settle_gateway_pending_run", lambda *a, **k: (0, None, 0))
-    gc.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
+    _config.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
     try:
         result = gc._run_gateway_runs_api_streaming(
             "sess-watchdog-harness", "hi", "test-model", "/tmp", STREAM_ID,
@@ -1760,7 +1761,7 @@ def test_stop_is_honoured_between_probe_retries():
     finally:
         for obj, name, value in reversed(saved):
             setattr(obj, name, value)
-        gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+        _config.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
 
     assert result[0] is None, "Stop must cancel the turn, not retry the budget"
     assert any(name == "cancel" for name, _ in events), f"events={events!r}"
@@ -1845,7 +1846,7 @@ def test_completed_status_stream_writeback_overwrites_partial_text():
     patch(gc, "_get_gateway_run_status", status)
     patch(urllib.request, "urlopen", urlopen)
     patch(ra, "settle_gateway_pending_run", lambda *a, **k: (0, None, 0))
-    gc.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
+    _config.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
     try:
         result = gc._run_gateway_runs_api_streaming(
             "sess-watchdog-harness", "hi", "test-model", "/tmp", STREAM_ID,
@@ -1853,11 +1854,11 @@ def test_completed_status_stream_writeback_overwrites_partial_text():
             put_gateway_event=lambda name, payload: None,
             cancel_event=FakeCancelEvent(clock),
         )
-        writeback = gc.STREAM_PARTIAL_TEXT.get(STREAM_ID)
+        writeback = _config.STREAM_PARTIAL_TEXT.get(STREAM_ID)
     finally:
         for obj, name, value in reversed(saved):
             setattr(obj, name, value)
-        gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+        _config.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
 
     assert result[0] == "Hello world"
     assert writeback == "Hello world", f"UI writeback must match the adopted output, got {writeback!r}"
@@ -1904,8 +1905,8 @@ def test_status_lane_cancel_persists_partial_reasoning_and_tool_buffers():
     models.SESSION_INDEX_FILE = pathlib.Path(tmp) / "_index.json"
     models.SESSIONS.clear()
     sid = "sess-watchdog-cancel-persist"
-    saved_reasoning = gc.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
-    saved_tools = gc.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
+    saved_reasoning = _config.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
+    saved_tools = _config.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
     try:
         session = models.Session(session_id=sid, title="Watchdog Harness", messages=[])
         session.active_stream_id = STREAM_ID
@@ -1919,9 +1920,9 @@ def test_status_lane_cancel_persists_partial_reasoning_and_tool_buffers():
         # shared partial buffer around the run (as the worker's setup does),
         # so the streamed partial is set the way the worker would have it
         # after the earlier connection — before the settle, after the run.
-        gc.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
-        gc.STREAM_REASONING_TEXT[STREAM_ID] = "thinking hard"
-        gc.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = [
+        _config.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
+        _config.STREAM_REASONING_TEXT[STREAM_ID] = "thinking hard"
+        _config.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = [
             {"name": "shell", "args": {"cmd": "ls"}, "done": False}]
 
         harness = run_turn(
@@ -1931,7 +1932,7 @@ def test_status_lane_cancel_persists_partial_reasoning_and_tool_buffers():
         assert harness["result"][0] is None, harness["result"]
         # A prior connection streamed a partial answer before the socket
         # dropped; the durable status then resolved cancelled.
-        gc.STREAM_PARTIAL_TEXT[STREAM_ID] = "partial answer so far"
+        _config.STREAM_PARTIAL_TEXT[STREAM_ID] = "partial answer so far"
         # The production settle is invoked at TWO sites: inside the streaming
         # function's status-lane cancel branch (persist-first, round-4) and
         # at the worker caller (`if final_text is None: ...`) for the other
@@ -1974,9 +1975,9 @@ def test_status_lane_cancel_persists_partial_reasoning_and_tool_buffers():
             status_script=[{"status": "interrupted"}],
         )
         assert harness["result"][0] is None, harness["result"]
-        gc.STREAM_PARTIAL_TEXT[STREAM_ID] = "interrupted partial"
-        gc.STREAM_REASONING_TEXT[STREAM_ID] = ""
-        gc.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = []
+        _config.STREAM_PARTIAL_TEXT[STREAM_ID] = "interrupted partial"
+        _config.STREAM_REASONING_TEXT[STREAM_ID] = ""
+        _config.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = []
         gc._settle_gateway_cancelled_turn(sid, STREAM_ID)
         models.SESSIONS.pop(sid, None)
         reloaded = models.get_session(sid)
@@ -1984,13 +1985,13 @@ def test_status_lane_cancel_persists_partial_reasoning_and_tool_buffers():
         assert len(partials) == 2, f"interrupted lane must persist too, got {partials!r}"
         assert partials[1].get("content") == "interrupted partial"
     finally:
-        gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
-        gc.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
-        gc.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
+        _config.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+        _config.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
+        _config.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
         if saved_reasoning is not None:
-            gc.STREAM_REASONING_TEXT[STREAM_ID] = saved_reasoning
+            _config.STREAM_REASONING_TEXT[STREAM_ID] = saved_reasoning
         if saved_tools is not None:
-            gc.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = saved_tools
+            _config.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = saved_tools
         models.SESSION_DIR, models.SESSION_INDEX_FILE = saved_dir, saved_index
         models.SESSIONS.clear()
         models.SESSIONS.update(saved_sessions)
@@ -2015,8 +2016,8 @@ def test_status_lane_cancel_successor_owner_and_empty_output_controls():
     models.SESSION_DIR = pathlib.Path(tmp)
     models.SESSION_INDEX_FILE = pathlib.Path(tmp) / "_index.json"
     models.SESSIONS.clear()
-    saved_reasoning = gc.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
-    saved_tools = gc.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
+    saved_reasoning = _config.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
+    saved_tools = _config.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
     try:
         # (a) successor owner: the session moved on to another stream.
         sid = "sess-watchdog-cancel-successor"
@@ -2028,9 +2029,9 @@ def test_status_lane_cancel_successor_owner_and_empty_output_controls():
         session.pending_user_message = None
         session.save()
         models.SESSIONS[sid] = session
-        gc.STREAM_PARTIAL_TEXT[STREAM_ID] = "stale partial of the old turn"
-        gc.STREAM_REASONING_TEXT[STREAM_ID] = "stale reasoning"
-        gc.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = [{"name": "shell", "args": {}, "done": False}]
+        _config.STREAM_PARTIAL_TEXT[STREAM_ID] = "stale partial of the old turn"
+        _config.STREAM_REASONING_TEXT[STREAM_ID] = "stale reasoning"
+        _config.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = [{"name": "shell", "args": {}, "done": False}]
         harness = run_turn(
             urlopen_script=[FakeSseResponse([b": ping", b""], end="eof")],
             status_script=[{"status": "cancelled"}],
@@ -2051,9 +2052,9 @@ def test_status_lane_cancel_successor_owner_and_empty_output_controls():
         session.pending_started_at = None
         session.save()
         models.SESSIONS[sid] = session
-        gc.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
-        gc.STREAM_REASONING_TEXT[STREAM_ID] = ""
-        gc.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = []
+        _config.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
+        _config.STREAM_REASONING_TEXT[STREAM_ID] = ""
+        _config.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = []
         harness = run_turn(
             urlopen_script=[FakeSseResponse([b": ping", b""], end="eof")],
             status_script=[{"status": "cancelled"}],
@@ -2070,13 +2071,13 @@ def test_status_lane_cancel_successor_owner_and_empty_output_controls():
             isinstance(m, dict) and m.get("role") == "user" and m.get("content") == "hi"
             for m in reloaded.messages)
     finally:
-        gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
-        gc.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
-        gc.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
+        _config.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+        _config.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
+        _config.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
         if saved_reasoning is not None:
-            gc.STREAM_REASONING_TEXT[STREAM_ID] = saved_reasoning
+            _config.STREAM_REASONING_TEXT[STREAM_ID] = saved_reasoning
         if saved_tools is not None:
-            gc.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = saved_tools
+            _config.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = saved_tools
         models.SESSION_DIR, models.SESSION_INDEX_FILE = saved_dir, saved_index
         models.SESSIONS.clear()
         models.SESSIONS.update(saved_sessions)
