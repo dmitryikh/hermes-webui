@@ -12,7 +12,7 @@ Output, for every stream-content event:
   (``LiveTurnSnapshot``).
 
 Because both outputs come from the same projection, the reconnect snapshot is
-always the fold of the journaled WebUI events. ``LiveTurnSnapshot.restore``
+always the fold of the journaled WebUI events. ``TurnCheckpoint.restore``
 relies on that: after a WebUI restart it rebuilds the snapshot by folding the
 journal with the very same ``apply`` the live path uses.
 
@@ -68,6 +68,16 @@ class LiveTurnSnapshot:
         STREAM_LIVE_TOOL_CALLS[stream_id] = []
 
     @staticmethod
+    def reset(stream_id: str) -> None:
+        """Empty the shared rows that exist (never creates rows for a released stream)."""
+        if stream_id in STREAM_PARTIAL_TEXT:
+            STREAM_PARTIAL_TEXT[stream_id] = ""
+        if stream_id in STREAM_REASONING_TEXT:
+            STREAM_REASONING_TEXT[stream_id] = ""
+        if stream_id in STREAM_LIVE_TOOL_CALLS:
+            STREAM_LIVE_TOOL_CALLS[stream_id] = []
+
+    @staticmethod
     def release(stream_id: str) -> None:
         STREAM_PARTIAL_TEXT.pop(stream_id, None)
         STREAM_REASONING_TEXT.pop(stream_id, None)
@@ -86,11 +96,6 @@ class LiveTurnSnapshot:
     @staticmethod
     def tool_calls(stream_id: str) -> list:
         return list(STREAM_LIVE_TOOL_CALLS.get(stream_id, []) or [])
-
-    def resync_text(self) -> str:
-        """Re-seed the local carrier from the shared row (after a relay died mid-stream)."""
-        self.text = STREAM_PARTIAL_TEXT.get(self.stream_id, self.text)
-        return self.text
 
     # ---- updates ------------------------------------------------------------
 
@@ -155,40 +160,76 @@ class LiveTurnSnapshot:
         elif event_name in {"tool", "tool_complete"}:
             self.note_tool(event_name, payload)
 
-    @classmethod
-    def restore(cls, session_id: str, stream_id: str) -> int | None:
-        """Rebuild the snapshot from this stream's run journal; return the Gateway replay cursor.
 
-        Relayed rows carry ``gateway_seq``, so the journal is the replay
-        cursor. Returns ``None`` (poll only) when a snapshot row lacks one or
-        the journal cannot be read: an unread journal proves no cursor, so
-        replaying from -1 would duplicate.
+class TurnCheckpoint:
+    """The single recovery state of a Gateway-backed turn.
+
+    A checkpoint is what the WebUI has relayed so far: the Gateway cursor of
+    the last relayed frame and the reconnect snapshot that relaying produced.
+    Every way a turn can lose its connection to the Gateway — read timeout,
+    HTTP error, reset, clean EOF, watchdog stall, WebUI restart — resumes from
+    a checkpoint the same way: ask the Gateway for events after ``cursor``
+    and keep projecting onto ``snapshot``.
+
+    In a live worker the checkpoint is maintained in lockstep with the run
+    journal (the relay commits each frame's cursor after its WebUI events are
+    journaled). After a WebUI restart ``restore`` rebuilds the identical
+    checkpoint by folding the journal with ``LiveTurnSnapshot.apply``.
+
+    ``replayable`` is False when no trustworthy cursor exists (the journal is
+    unreadable, or has snapshot rows without a Gateway cursor): replaying
+    from any cursor could duplicate output, so the turn is followed by
+    durable run status only.
+    """
+
+    __slots__ = ("snapshot", "cursor", "replayable")
+
+    def __init__(self, stream_id: str, *, text: str | None = None, cursor: int = -1, replayable: bool = True):
+        self.snapshot = LiveTurnSnapshot(stream_id, text=text)
+        self.cursor = cursor
+        self.replayable = replayable
+
+    @property
+    def stream_id(self) -> str:
+        return self.snapshot.stream_id
+
+    @property
+    def text(self) -> str:
+        return self.snapshot.text
+
+    def commit(self, seq: int) -> None:
+        """Advance the cursor past a frame whose events have been relayed."""
+        self.cursor = seq
+
+    @classmethod
+    def restore(cls, session_id: str, stream_id: str) -> "TurnCheckpoint":
+        """Rebuild the checkpoint (and the stream's snapshot rows) from the run journal.
+
+        Idempotent: the snapshot rows are reset and re-folded from the journal.
+        Every journaled row (approvals included) advances the cursor.
         """
         from api.run_journal import read_run_events
 
         try:
             events = read_run_events(session_id, stream_id).get("events") or []
         except Exception:
-            logger.debug("Failed to read run journal for reattached stream %s", stream_id, exc_info=True)
-            return None
+            logger.debug("Failed to read run journal for stream %s", stream_id, exc_info=True)
+            return cls(stream_id, text="", replayable=False)
         stateful, cursor = [], -1
         for row in events:
             payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
             seq = payload.get("gateway_seq")
             if row.get("event") in SNAPSHOT_EVENTS:
                 if not isinstance(seq, int):
-                    return None
+                    return cls(stream_id, text="", replayable=False)
                 stateful.append((row["event"], payload))
-            # Every relayed row (approval included) advances the cursor, not just the stateful ones.
             if isinstance(seq, int):
                 cursor = max(cursor, seq)
-        snapshot = cls(stream_id, text="")
+        LiveTurnSnapshot.reset(stream_id)
+        checkpoint = cls(stream_id, text="", cursor=cursor)
         for name, payload in stateful:
-            if name == "token":
-                # A restored stream owns its text row even if the restart lost it.
-                STREAM_PARTIAL_TEXT.setdefault(stream_id, "")
-            snapshot.apply(name, payload)
-        return cursor
+            checkpoint.snapshot.apply(name, payload)
+        return checkpoint
 
 
 class GatewayEventProjector:

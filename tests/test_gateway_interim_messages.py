@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 from api import gateway_chat as g, config, models, run_journal
-from api.gateway_projection import LiveTurnSnapshot
+from api.gateway_projection import LiveTurnSnapshot, TurnCheckpoint
 import pytest
 from unittest.mock import MagicMock
 
@@ -78,7 +78,7 @@ def test_success_writeback_keeps_commentary_outside_model_context(monkeypatch, t
         rows = run_journal.read_run_events('sid','stream')['events']
         assert len([row for row in rows if row['event'] == 'interim_assistant']) == 2
         config.STREAM_PARTIAL_TEXT['stream'] = ''
-        assert LiveTurnSnapshot.restore('sid','stream') == 4
+        assert TurnCheckpoint.restore('sid','stream').cursor == 4
         assert config.STREAM_PARTIAL_TEXT['stream'] == 'Final.'
 
 @pytest.mark.parametrize('terminal', ['failed', 'cancelled'])
@@ -208,7 +208,7 @@ def test_invalid_interim_does_not_reset_answer(text):
 
 def test_interim_without_cursor_fails_closed_to_status_polling(monkeypatch):
     monkeypatch.setattr(run_journal,'read_run_events',lambda *a,**k:{'events':[{'event':'interim_assistant','payload':{'text':'Checking'}}]})
-    assert LiveTurnSnapshot.restore('sid','stream') is None
+    assert TurnCheckpoint.restore('sid','stream').replayable is False
 
 def test_journal_commentary_recovery_is_idempotent_and_final_free(monkeypatch):
     rows = [
@@ -290,7 +290,7 @@ def test_restart_restores_only_open_answer_segment(monkeypatch, sealed_reasoning
         {'event':'reasoning','payload':{'text':open_reasoning,'gateway_seq':4}},
     ]
     monkeypatch.setattr(run_journal, 'read_run_events', lambda *a,**k: {'events':rows})
-    assert LiveTurnSnapshot.restore('sid','stream') == 4
+    assert TurnCheckpoint.restore('sid','stream').cursor == 4
     assert config.STREAM_PARTIAL_TEXT['stream'] == 'Ans'
     assert config.STREAM_REASONING_TEXT['stream'] == open_reasoning
     result, events, seqs = relay([frame('message.delta',5,delta='wer.'),frame('run.completed',6,output='Answer.')],final_text=LiveTurnSnapshot('stream').text)

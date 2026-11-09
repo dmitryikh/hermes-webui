@@ -30,7 +30,7 @@ from api.gateway_events import (
     decode_runs_frame,
     decode_session_event,
 )
-from api.gateway_projection import GatewayEventProjector, LiveTurnSnapshot
+from api.gateway_projection import GatewayEventProjector, LiveTurnSnapshot, TurnCheckpoint
 from api.gateway_sse import SseFrame, iter_sse_frames
 
 STREAM = "layers-stream"
@@ -204,10 +204,54 @@ def test_restored_snapshot_equals_the_live_snapshot(monkeypatch, registered_stre
 
     LiveTurnSnapshot.register(registered_stream)
     monkeypatch.setattr(run_journal, "read_run_events", lambda *a, **k: {"events": journal})
-    assert LiveTurnSnapshot.restore("sid", registered_stream) == len(journal) - 1
+    checkpoint = TurnCheckpoint.restore("sid", registered_stream)
+    assert (checkpoint.cursor, checkpoint.replayable, checkpoint.text) == (len(journal) - 1, True, "Ans")
     restored = (
         LiveTurnSnapshot.partial_text(registered_stream),
         LiveTurnSnapshot.reasoning_text(registered_stream),
         LiveTurnSnapshot.tool_calls(registered_stream),
     )
     assert restored == live
+
+
+def test_checkpoint_restore_is_idempotent_and_fails_closed(monkeypatch, registered_stream):
+    journal = [
+        {"event": "token", "payload": {"text": "Hi", "gateway_seq": 0}},
+        {"event": "approval", "payload": {"approval_id": "a", "gateway_seq": 1}},
+    ]
+    monkeypatch.setattr(run_journal, "read_run_events", lambda *a, **k: {"events": journal})
+    config.STREAM_PARTIAL_TEXT[registered_stream] = "stale"
+    for _ in range(2):  # recovering twice rebuilds the same state
+        checkpoint = TurnCheckpoint.restore("sid", registered_stream)
+        assert (checkpoint.cursor, checkpoint.replayable, checkpoint.text) == (1, True, "Hi")
+        assert config.STREAM_PARTIAL_TEXT[registered_stream] == "Hi"
+
+    # A snapshot row without a Gateway cursor: replaying from anywhere could duplicate.
+    journal.append({"event": "token", "payload": {"text": "?"}})
+    assert TurnCheckpoint.restore("sid", registered_stream).replayable is False
+
+    def unreadable(*a, **k):
+        raise OSError("journal unreadable")
+
+    monkeypatch.setattr(run_journal, "read_run_events", unreadable)
+    assert TurnCheckpoint.restore("sid", registered_stream).replayable is False
+
+
+def test_relay_updates_the_checkpoint_in_place_when_the_connection_dies(registered_stream):
+    """Nothing is resynced after a reset: the checkpoint already holds every relayed frame."""
+    import threading
+
+    from api import gateway_chat
+
+    def dying():
+        yield ('data: ' + json.dumps({"event": "message.delta", "delta": "A", "seq": 5})).encode()
+        raise ConnectionResetError("reset by peer")
+
+    checkpoint = TurnCheckpoint(registered_stream, text="")
+    with pytest.raises(ConnectionResetError):
+        gateway_chat._relay_gateway_run_events(
+            dying(), "sid", registered_stream, "run", "http://x", "",
+            put_gateway_event=lambda e, d: None, cancel_event=threading.Event(), checkpoint=checkpoint,
+        )
+    assert (checkpoint.cursor, checkpoint.text) == (5, "A")
+    assert config.STREAM_PARTIAL_TEXT[registered_stream] == "A"

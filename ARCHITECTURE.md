@@ -430,8 +430,23 @@ the next level only through its output type:
   projected: their side effects are orchestration and stay in `gateway_chat.py`.
 - Invariant: every snapshot update comes from the same projection that emits
   the journaled WebUI event, so the snapshot is the fold of the journal.
-  `LiveTurnSnapshot.restore()` rebuilds it after a WebUI restart by folding
+  `TurnCheckpoint.restore()` rebuilds it after a WebUI restart by folding
   the journal with the same `LiveTurnSnapshot.apply()`.
+
+Recovery is one procedure for every Runs API turn. A `TurnCheckpoint` (the
+Gateway cursor of the last relayed frame plus the snapshot it produced) is the
+only resume state: the relay updates it in place frame by frame, so a dying
+connection loses nothing. `_GatewayRunFollower` follows the run from a
+checkpoint, and every lost connection — read timeout, reset, HTTP error, clean
+EOF, watchdog stall, WebUI restart — goes through its `recover()`: probe the
+durable run status, surface a parked approval, settle a terminal run from the
+status, otherwise pace and reconnect `/events` from the checkpoint cursor.
+A live turn starts from a fresh checkpoint; a turn that outlived the WebUI
+process starts from `TurnCheckpoint.restore()` and begins with `recover()`.
+A checkpoint without a trustworthy cursor (unreadable journal, snapshot rows
+without `gateway_seq`) follows the run by status only. When the turn ends,
+`_restore_sealed_commentary()` is the one place its sealed interim commentary
+is rebuilt from the journal, for completed, failed and cancelled outcomes alike.
 
 ### 4.5 Approval System Integration
 

@@ -48,7 +48,7 @@ from api.gateway_events import (
     decode_runs_frame,
     nonzero_usage,
 )
-from api.gateway_projection import GatewayEventProjector, LiveTurnSnapshot
+from api.gateway_projection import GatewayEventProjector, LiveTurnSnapshot, TurnCheckpoint
 from api import gateway_sse
 from api.gateway_sse import iter_lines_cancellable, iter_sse_frames
 from api.helpers import _redact_text, redact_session_data
@@ -841,7 +841,7 @@ def _open_gateway_run_events(base_url, headers, run_id, last_seq: int = -1, read
 
 def _relay_gateway_run_events(
     resp, session_id, stream_id, run_id, base_url, api_key,
-    *, put_gateway_event, cancel_event, on_seq=None, final_text="", stop_on_truncated=False,
+    *, put_gateway_event, cancel_event, checkpoint=None, on_seq=None, final_text="",
     surfaced_approval_ids=None, output_is_authoritative=False, approval_is_current=None,
     watchdog_secs=None,
 ):
@@ -861,12 +861,16 @@ def _relay_gateway_run_events(
     (round-7 review: cumulative text cannot drive the reset, because the
     relay is seeded from the turn-wide buffer).
 
-    outcome is "ended", "eof", "truncated" (the gateway dropped events after our cursor;
-    only returned with ``stop_on_truncated``, otherwise the retained events keep relaying),
-    or "stalled" (only with ``watchdog_secs``). Relayed payloads carry ``gateway_seq`` so
-    the WebUI run journal records the gateway cursor; ``on_seq`` commits each seq as soon
-    as its event is relayed, so a reconnect never re-emits it.
-    ``final_text`` seeds the open answer segment (the caller passes what the browser has seen).
+    outcome is "ended", "eof" or "stalled" (only with ``watchdog_secs``). A
+    ``replay.truncated`` frame is logged and the retained events keep relaying:
+    the final answer comes from ``run.completed``/durable status, not from the
+    streamed text. Relayed payloads carry ``gateway_seq`` so the WebUI run
+    journal records the gateway cursor; each frame's seq is committed to
+    ``checkpoint`` as soon as its events are relayed (then ``on_seq`` observes
+    it), so a reconnect from the checkpoint never re-emits it.
+    ``checkpoint`` (a ``TurnCheckpoint``) is the turn's recovery state and is
+    updated in place, so nothing is lost when the connection raises; without
+    one, a fresh checkpoint is seeded from ``final_text``.
     ``surfaced_approval_ids`` is shared with the reattach status probe so one approval surfaces once.
     ``output_is_authoritative`` lets ``run.completed.output`` replace streamed text (reattach: the
     Agent may transform its answer after streaming). ``approval_is_current`` drops replayed approvals
@@ -907,11 +911,15 @@ def _relay_gateway_run_events(
 
     def commit():
         nonlocal seq
-        if seq is not None and on_seq is not None:
-            on_seq(seq)
+        if seq is not None:
+            checkpoint.commit(seq)
+            if on_seq is not None:
+                on_seq(seq)
         seq = None
 
-    snapshot = LiveTurnSnapshot(stream_id, text=final_text)
+    if checkpoint is None:
+        checkpoint = TurnCheckpoint(stream_id, text=final_text)
+    snapshot = checkpoint.snapshot
     projector = GatewayEventProjector(
         snapshot,
         emit,
@@ -967,8 +975,6 @@ def _relay_gateway_run_events(
             break
         seq = frame.seq
         if any(isinstance(event, ReplayTruncated) for event in frame.events):
-            if stop_on_truncated:
-                return snapshot.text, usage, "truncated", False
             logger.info("Gateway replay for run %s truncated; relaying retained events", run_id)
             continue
         # Any parsed, non-replay-control frame counts as per-connection
@@ -1232,321 +1238,11 @@ def _run_gateway_runs_api_streaming(
     if on_run_id is not None:
         on_run_id(run_id)
 
-    # Watchdog consume loop (#7978, ported onto the relay-helper architecture):
-    # the browser-facing turn must never outlive its gateway run. A single SSE
-    # connection is fragile — a lost terminal frame (run.completed / close race)
-    # left a keepalive-only stream pinned forever. Each connection now carries a
-    # short no-real-events budget; when it trips (or the socket EOFs/drops)
-    # without a terminal frame, the pollable run status is the source of truth:
-    #   terminal   -> finalize from what already streamed (Fix 1)
-    #   cancelled  -> surface cancellation (buffers persisted by the caller's
-    #                 cancelled-turn settle)
-    #   still live -> reconnect with Last-Event-ID and keep relaying
-    # Probe failures share the reattach poller's budget
-    # (GATEWAY_REATTACH_MAX_POLL_FAILURES / GATEWAY_REATTACH_POLL_INTERVAL) so a
-    # transient status blip cannot kill a run that is alive and streaming
-    # (Fix 2); Stop is honoured between attempts and the events stream keeps
-    # reconnecting between probe rounds. A durable-status 404 is exempt from
-    # that budget: it is the gateway's definitive "no record of this run"
-    # (unlike a transport error or 5xx, where the run may still be alive), so
-    # it must not spin the turn for ~5 minutes (round-2 review).
-    _WATCHDOG_SECS = _GATEWAY_WATCHDOG_SECS
-    from api.route_approvals import settle_gateway_pending_run
-    last_seq = [-1]
-    status_404_streak = 0
-    probe_failures = 0
-    # The turn's open answer segment across every reconnect; each relay
-    # connection is seeded from the shared row, so this local carrier and
-    # STREAM_PARTIAL_TEXT cannot diverge (round-4 Greptile item 1).
-    turn = LiveTurnSnapshot(stream_id, text="")
-    usage: dict = {}
-    # Round-4 review (Greptile item 4): shared with the events relay so one
-    # approval surfaces exactly once across reconnects, status re-probes, and
-    # both lanes (same contract as the reattach status probe).
-    surfaced_approval_ids: set[str] = set()
-
-    def _settle_by_status(status: dict):
-        """Decide the turn from the durable run status (Fix 1: the only success
-        arbiter). Returns ``(action, value)`` with action in
-        ``{"continue", "cancel", "raise", "success"}``; ``"success"`` carries
-        the usage delta and has already adopted the final answer per Fix 3."""
-        state = str(status.get("status") or "").strip().lower()
-        if state not in _GATEWAY_RUN_TERMINAL_STATUSES:
-            return "continue", None
-        # Same order as the events relay and the reattach poller: replay steer text the Gateway accepted but the run
-        # never consumed before settling, or a turn that ends after an events EOF loses it (the browser already
-        # cleared the accepted submission).
-        _relay_gateway_pending_steer(session_id, status, put_gateway_event)
-        settle_gateway_pending_run(
-            session_id,
-            run_id,
-            reason=f"Gateway run {state} before approval resolution",
-        )
-        if state in ("cancelled", "interrupted"):
-            return "cancel", None
-        if state != "completed":
-            return "raise", RuntimeError(str(status.get("error") or f"Gateway run {state}"))
-        output = str(status.get("output") or "")
-        if not output:
-            # Round-4 review (Greptile item 1): the settle path is
-            # deterministic — final answer = status output when non-empty,
-            # ELSE the accumulated partial text (either carrier), never ""
-            # when partial text exists.
-            output = turn.text or LiveTurnSnapshot.partial_text(stream_id)
-        if output:
-            # Fix 3: prefer the non-empty durable output over whatever the
-            # stream carried; adopt into BOTH carriers so the UI writeback
-            # matches the settled turn text.
-            turn.adopt_text(output)
-        return "success", nonzero_usage(status)
-
-    def _surface_status_approval(status: dict):
-        """Round-4 review (Greptile item 4): mirror the reattach path's
-        parked-approval surface — when the durable status is
-        ``waiting_for_approval`` and carries the approval payload, surface the
-        card from status (the events feed may have lost it or be unable to
-        replay it), deduped by approval key so reconnects and re-probes never
-        double-card. ``waiting_for_approval`` is not terminal, so the caller
-        then continues the loop.
-
-        Round-4 maintainer must-fix: the status payload carries only the
-        gateway's LATEST pending approval. Mirroring it ahead of the
-        cursor-ordered /events replay inverts the FIFO queue when several
-        approvals are pending (a stall surfaces B, the replay then delivers
-        A -> B, and the approved card can resolve a different command than
-        the one shown). Exact-id recovery is trustworthy only when the
-        payload carries a non-blank raw ``approval_id``/``id`` AND the
-        gateway advertises ``approval_identity_v1``; without both, skip the
-        status-card insert entirely so the replay alone orders the queue
-        A -> B."""
-        approval = _gateway_status_approval(status)
-        if (
-            str(status.get("status") or "").strip().lower() == "waiting_for_approval"
-            and isinstance(approval, dict)
-        ):
-            raw_approval_id = _gateway_prompt_identity(approval)
-            exact_generation = approval.get("execution_generation")
-            from api.config import gateway_supports_approval_identity_v1
-            if not (
-                raw_approval_id
-                and (
-                    type(exact_generation) is int
-                    or gateway_supports_approval_identity_v1(base_url, api_key)
-                )
-            ):
-                return
-            approval_key = _gateway_approval_key(approval)
-            if approval_key and approval_key not in surfaced_approval_ids:
-                relayed = _relay_gateway_run_approval(
-                    session_id, run_id, approval, base_url, api_key,
-                    put_gateway_event=put_gateway_event,
-                )
-                # Register only after a successful relay: a payload the
-                # translator rejects must not suppress the later event-feed
-                # replay of the same approval (round-4 maintainer minor).
-                if relayed:
-                    surfaced_approval_ids.add(approval_key)
-
-    clean_eof_reconnects = 0
-    while True:
-        if cancel_event.is_set():
-            put_gateway_event("cancel", {"message": "Cancelled by user"})
-            return None, usage
-        resp = None
-        outcome = "eof"
-        events_unreachable = False
-        stream_text = None
-        accepted_frame = False
-        try:
-            resp = _open_gateway_run_events(
-                base_url, headers, run_id, last_seq[0],
-                # Round-4 review (Greptile item 3): bound the per-read wait by
-                # the watchdog budget so a byte-silent socket surfaces within
-                # ~budget and the stall/status/Stop logic can run.
-                read_timeout_secs=_WATCHDOG_SECS + _GATEWAY_WATCHDOG_READ_EPSILON,
-            )
-        except urllib.error.HTTPError as exc:
-            # Fix 1: the events stream is gone (404 after a restart) or the
-            # endpoint refuses; the durable run status — not any already-
-            # streamed text — decides the outcome. Fall through to the probe.
-            logger.warning(
-                "Gateway events stream for run %s connect failed (HTTP %s); probing durable run status",
-                run_id, exc.code)
-            events_unreachable = True
-        except (urllib.error.URLError, OSError):
-            events_unreachable = True  # connect failure: fall through to the status probe below
-        if resp is not None:
-            try:
-                with resp:
-                    stream_text, stream_usage, outcome, accepted_frame = _relay_gateway_run_events(
-                        resp, session_id, stream_id, run_id, base_url, api_key,
-                        put_gateway_event=put_gateway_event, cancel_event=cancel_event,
-                        # Cursor commit: the internal reconnect cursor ALWAYS
-                        # advances (the next /events reopen must send
-                        # Last-Event-ID or delivered tokens replay into the
-                        # answer — round-5 review), then the optional
-                        # observer (harness/test seam) is notified.
-                        on_seq=lambda event_seq: (
-                            last_seq.__setitem__(0, event_seq),
-                            on_seq(event_seq) if on_seq is not None else None,
-                        ),
-                        # Seed from what the browser has seen so far.
-                        final_text=LiveTurnSnapshot(stream_id).text,
-                        # Round-2 Fix 3 for this lane: a non-empty
-                        # run.completed/output replaces the streamed text
-                        # (overwrite, not fill-if-empty).
-                        output_is_authoritative=True,
-                        surfaced_approval_ids=surfaced_approval_ids,
-                        watchdog_secs=_WATCHDOG_SECS,
-                    )
-            except (urllib.error.URLError, OSError):
-                # read timeout / reset mid-stream: fall through to the status
-                # probe, and pace the reconnect below it
-                events_unreachable = True
-                # Maintainer must-fix (round-3 re-review): the relay died with
-                # the exception, so its LOCAL text carrier is lost — the
-                # streamed deltas survive only in the shared buffer it appended
-                # to line by line. Re-sync before durable status arbitration;
-                # the deterministic settle below then keeps (or adopts) the
-                # accumulated text.
-                turn.resync_text()
-            else:
-                turn.text = stream_text
-                usage.update({k: v for k, v in stream_usage.items() if v})
-        if outcome == "ended":
-            # Terminal frame relayed (or the user/gateway cancelled); the
-            # caller settles the turn from the returned text.
-            return turn.text, usage
-        # Per-connection progress (any real frame accepted on THIS
-        # connection) resets the clean-EOF reconnect backoff. Round-7
-        # review: this must NOT key on cumulative turn text — the relay is
-        # seeded from the turn-wide buffer, so after the first delta every
-        # clean EOF would return non-empty text and the backoff would
-        # never double (a flat 0.5s forever, ~110 reconnects/minute).
-        # A watchdog STALL is a connection that stayed live for the whole
-        # budget (keepalives flowing), not a clean EOF the gateway slammed
-        # shut: it must not accumulate the pacing either (round-8 review).
-        if accepted_frame or outcome == "stalled":
-            clean_eof_reconnects = 0
-        # ---- durable status probe: the only success arbiter (Fix 1) ----
-        # Round-3 review: the 404 grace re-probe lives HERE, inside status
-        # arbitration — before any /events reopen. The first 404 is re-probed
-        # immediately (no reconnect in between, no poll-interval sleep); a
-        # second consecutive 404 fails the turn closed; any non-404 outcome is
-        # authoritative through the settle table below and resets the streak.
-        # Only a non-terminal arbitration reaches the loop top, which is what
-        # reopens /events. Transport and 5xx probe failures keep the paced
-        # reattach budget and reset the 404 streak (the run may still be
-        # alive there, unlike after a definitive 404).
-        status = None
-        probe_paced = False
-        for _grace_attempt in range(_STATUS_404_GRACE_PROBES):
-            try:
-                status = _get_gateway_run_status(base_url, api_key, run_id)
-            except urllib.error.HTTPError as exc:
-                if exc.code in (401, 403):
-                    # Credentials cannot self-heal; fail now (mirrors the reattach poller).
-                    raise RuntimeError(
-                        f"Gateway rejected the WebUI credentials (HTTP {exc.code}) while polling run {run_id}"
-                    ) from exc
-                if exc.code == 404:
-                    # Terminal, not retryable (round-2 review): a durable-status
-                    # 404 is the gateway's definitive "I have no record of this
-                    # run", so it must not spend the long reattach budget that
-                    # exists for transport errors and 5xx (where the run may
-                    # still be alive). Only a small grace guards the status-
-                    # before-registration race.
-                    status_404_streak += 1
-                    if status_404_streak >= _STATUS_404_GRACE_PROBES:
-                        raise RuntimeError(
-                            "Gateway no longer has the run; failing the turn rather "
-                            "than settling partial streamed output") from exc
-                    # First consecutive 404: immediately re-probe the status
-                    # endpoint. No /events reopen, no poll-interval sleep;
-                    # Stop (cancel_event) is honoured between the two probes.
-                    if cancel_event.is_set():
-                        put_gateway_event("cancel", {"message": "Cancelled by user"})
-                        return None, usage
-                    continue
-                # Non-404 HTTP (5xx/blip): Fix 2 — a probe failure is not
-                # proof the run is gone. Wait out the poll interval (Stop is
-                # honoured between attempts) and reconnect the events stream
-                # from the top of the loop.
-                probe_failures += 1
-                status_404_streak = 0
-                if probe_failures >= GATEWAY_REATTACH_MAX_POLL_FAILURES:
-                    raise RuntimeError(
-                        "Gateway became unreachable while waiting for the run to finish") from exc
-                cancel_event.wait(GATEWAY_REATTACH_POLL_INTERVAL)
-                probe_paced = True
-                break
-            except (urllib.error.URLError, OSError, ValueError) as exc:
-                probe_failures += 1
-                status_404_streak = 0
-                if probe_failures >= GATEWAY_REATTACH_MAX_POLL_FAILURES:
-                    raise RuntimeError(
-                        "Gateway became unreachable while waiting for the run to finish") from exc
-                cancel_event.wait(GATEWAY_REATTACH_POLL_INTERVAL)
-                probe_paced = True
-                break
-            probe_failures = 0
-            status_404_streak = 0
-            break
-        if probe_paced:
-            continue
-        # Round-4 review (Greptile item 4): surface a parked approval carried
-        # by the durable status BEFORE arbitrating — waiting_for_approval is
-        # not terminal, so the settle below returns "continue" and the loop
-        # reconnects /events with the card already up.
-        _surface_status_approval(status)
-        action, value = _settle_by_status(status)
-        if action == "continue":
-            # Still running: reconnect and resume from the last seen event id,
-            # pacing the reconnect when the events channel just failed so a
-            # broken endpoint cannot hot-loop the probe.
-            if events_unreachable:
-                cancel_event.wait(GATEWAY_REATTACH_POLL_INTERVAL)
-            else:
-                # Round-5/6 review (maintainer, shipping gate for #8030): a
-                # CLEAN EOF — the connection accepted then closed with no
-                # terminal frame and no transport error — reconnects
-                # immediately, so a gateway or proxy that closes every few
-                # milliseconds hot-loops this thread (his witness: 3,000
-                # reconnects / 3,001 probes in 60s, zero waits). Back off
-                # between consecutive clean-EOF reconnects, doubling to a
-                # cap; any real progress (a data frame committed a new seq)
-                # resets the backoff below, and Stop is honoured during the
-                # wait. The status probe still runs every cycle, so a run
-                # that completes while we are backed off is still observed.
-                clean_eof_reconnects += 1
-                # Bound the EXPONENT before multiplying: unbounded,
-                # 2 ** 1024 overflows float conversion at reconnect ~1,025
-                # (~8.5h into a stuck turn) and kills the turn with
-                # OverflowError (round-7 review, CORE). 6 * ln2 doubling
-                # steps (x64) already exceed the 30s cap from the 0.5s base.
-                backoff = min(
-                    _CLEAN_EOF_BACKOFF_BASE_SECS
-                    * (2 ** min(clean_eof_reconnects - 1, 6)),
-                    _CLEAN_EOF_BACKOFF_MAX_SECS,
-                )
-                cancel_event.wait(backoff)
-            continue
-        if action == "cancel":
-            # Maintainer should-fix (round-3 re-review): persist the cancelled
-            # turn BEFORE emitting the browser-facing cancel event — the
-            # browser handler fetches the session as soon as the event lands
-            # and must not read pre-persistence state. The caller's own
-            # cancelled-turn settle below is a no-op after this one (the
-            # ownership guard short-circuits, and partial/marker inserts are
-            # signature-deduped), so no extra handshake is needed.
-            _settle_gateway_cancelled_turn(session_id, stream_id)
-            put_gateway_event("cancel", {"message": "Cancelled by gateway"})
-            return None, usage
-        if action == "raise":
-            raise value
-        usage.update(value)
-        break
-    return turn.text, usage
+    return _GatewayRunFollower(
+        session_id, stream_id, run_id, base_url, api_key,
+        put_gateway_event=put_gateway_event, cancel_event=cancel_event,
+        checkpoint=TurnCheckpoint(stream_id, text=""), on_seq=on_seq,
+    ).run()
 
 
 def stop_gateway_run(run_id: str) -> bool:
@@ -1746,25 +1442,132 @@ def _get_gateway_run_status(base_url: str, api_key: str, run_id: str) -> dict:
 
 def _await_gateway_run_result(
     session_id, stream_id, run_id, base_url, api_key,
-    *, put_gateway_event, cancel_event, resume_seq=None,
+    *, put_gateway_event, cancel_event,
 ):
     """Resume a run started by a previous WebUI process; same return contract as _run_gateway_runs_api_streaming.
 
-    Streams /events from ``resume_seq``; polls run status when replay is truncated, unavailable, or unaligned.
+    The turn resumes from the checkpoint the run journal describes, through the
+    same follower (and recovery procedure) a live turn uses.
     """
-    from api.route_approvals import settle_gateway_pending_run
-
     _publish_gateway_run_id(stream_id, run_id)
     update_active_run(stream_id, phase="gateway-reattached")
-    surfaced_approval_ids: set[str] = set()
-    failures = 0
-    last_seq = [resume_seq if resume_seq is not None else -1]
-    streaming = resume_seq is not None
+    return _GatewayRunFollower(
+        session_id, stream_id, run_id, base_url, api_key,
+        put_gateway_event=put_gateway_event, cancel_event=cancel_event,
+        checkpoint=TurnCheckpoint.restore(session_id, stream_id), resumed=True,
+    ).run()
 
-    def approval_is_current(payload):
-        # Auto-approved before the restart leaves no journal row; only the Gateway knows it is settled.
+
+class _GatewayRunFollower:
+    """Follow one admitted Gateway run to its outcome; the single recovery procedure.
+
+    Every connection loss — read timeout, transport error, HTTP error on
+    ``/events``, clean EOF, watchdog stall (#7978) and a WebUI restart —
+    goes through the same ``recover()`` step:
+
+      1. probe the durable run status, the only success arbiter;
+      2. surface an approval the run is parked on (the events replay may
+         have lost it or never re-send it);
+      3. terminal  -> settle the turn from the status (output, else the
+                      checkpoint's streamed text) and stop;
+         running   -> pace, then reconnect ``/events`` from the
+                      ``TurnCheckpoint`` cursor and keep projecting onto its
+                      snapshot.
+
+    The checkpoint is the only resume state: a live turn starts from a fresh
+    one; a turn that outlived the WebUI process starts from
+    ``TurnCheckpoint.restore`` (the run journal) and begins with
+    ``recover()``, because approvals relayed before the restart sit behind
+    the replay cursor. A checkpoint without a trustworthy cursor follows the
+    run by status only.
+
+    ``resumed`` marks a follower whose in-memory approval state was lost with
+    the previous process: status approvals are surfaced without an exact
+    identity, and replayed approvals are checked against the Gateway before
+    they surface (an auto-approved one leaves no journal row).
+    """
+
+    def __init__(self, session_id, stream_id, run_id, base_url, api_key, *,
+                 put_gateway_event, cancel_event, checkpoint, resumed=False, on_seq=None):
+        self.session_id, self.stream_id, self.run_id = session_id, stream_id, run_id
+        self.base_url, self.api_key = base_url, api_key
+        self.put_gateway_event, self.cancel_event = put_gateway_event, cancel_event
+        self.checkpoint, self.resumed, self.on_seq = checkpoint, resumed, on_seq
+        self.headers = _gateway_run_headers(session_id, api_key)
+        self.usage: dict = {}
+        # One approval surfaces once across reconnects, status probes and both
+        # sources (events replay and status).
+        self.surfaced_approval_ids: set[str] = set()
+        self.probe_failures = 0
+        self.status_404_streak = 0
+        self.clean_eof_reconnects = 0
+        # The relay's result for an "ended" connection: the final text, or None when cancelled.
+        self.ended_text = None
+
+    def run(self):
+        """Return ``(final text, usage)``, or ``(None, usage)`` when the turn was cancelled."""
+        outcome = "resume" if self.resumed else None
+        while True:
+            if self.cancel_event.is_set():
+                self.put_gateway_event("cancel", {"message": "Cancelled by user"})
+                return None, self.usage
+            if outcome is not None:
+                settled = self.recover(outcome)
+                if settled is not None:
+                    return settled
+                if self.cancel_event.is_set():
+                    continue
+            outcome = self.stream() if self.checkpoint.replayable else "poll"
+            if outcome == "ended":
+                return self.ended_text, self.usage
+
+    # ---- one /events connection ----------------------------------------------
+
+    def stream(self) -> str:
+        """Relay one events connection from the checkpoint; return how it ended.
+
+        ``"ended"`` (terminal frame relayed, or cancelled), ``"eof"``,
+        ``"stalled"`` or ``"unreachable"`` (connect/read failure).
+        """
         try:
-            status = _get_gateway_run_status(base_url, api_key, run_id)
+            resp = _open_gateway_run_events(
+                self.base_url, self.headers, self.run_id, self.checkpoint.cursor,
+                # Bound each read by the watchdog budget so a byte-silent socket
+                # surfaces within ~budget and Stop/stall handling can run.
+                read_timeout_secs=_GATEWAY_WATCHDOG_SECS + _GATEWAY_WATCHDOG_READ_EPSILON,
+            )
+        except (urllib.error.URLError, OSError) as exc:
+            logger.warning("Gateway events stream for run %s unavailable (%s); probing durable run status",
+                           self.run_id, getattr(exc, "code", exc.__class__.__name__))
+            return "unreachable"
+        try:
+            with resp:
+                text, usage, outcome, accepted_frame = _relay_gateway_run_events(
+                    resp, self.session_id, self.stream_id, self.run_id, self.base_url, self.api_key,
+                    put_gateway_event=self.put_gateway_event, cancel_event=self.cancel_event,
+                    checkpoint=self.checkpoint, on_seq=self.on_seq,
+                    # The Agent may transform its answer after streaming.
+                    output_is_authoritative=True,
+                    surfaced_approval_ids=self.surfaced_approval_ids,
+                    approval_is_current=self.approval_is_current if self.resumed else None,
+                    watchdog_secs=_GATEWAY_WATCHDOG_SECS,
+                )
+        except (urllib.error.URLError, OSError):
+            # Read timeout / reset mid-stream. Nothing is lost: the relay
+            # updated the checkpoint frame by frame.
+            return "unreachable"
+        self.usage.update({k: v for k, v in usage.items() if v})
+        # Per-connection progress resets the clean-EOF backoff (never the
+        # cumulative turn text, which seeds every reconnect). A stall is a
+        # connection that stayed open for the whole budget, not a fast close.
+        if accepted_frame or outcome == "stalled":
+            self.clean_eof_reconnects = 0
+        self.ended_text = text
+        return outcome
+
+    def approval_is_current(self, payload) -> bool:
+        try:
+            status = _get_gateway_run_status(self.base_url, self.api_key, self.run_id)
         except (urllib.error.URLError, OSError, ValueError):
             return True  # fail open: a stale card 409s, a missing one stalls the run
         approval = _gateway_status_approval(status)
@@ -1774,77 +1577,141 @@ def _await_gateway_run_result(
             and _gateway_approval_key(approval) == _gateway_approval_key(payload)
         )
 
-    def surface_parked_approval(status):
-        approval = _gateway_status_approval(status)
-        if str(status.get("status") or "").strip().lower() == "waiting_for_approval" and isinstance(approval, dict):
-            approval_key = _gateway_approval_key(approval)
-            if approval_key not in surfaced_approval_ids:
-                surfaced_approval_ids.add(approval_key)
-                _relay_gateway_run_approval(
-                    session_id, run_id, approval, base_url, api_key, put_gateway_event=put_gateway_event,
-                )
+    # ---- recovery ------------------------------------------------------------
 
-    # Poll status before the first blocking /events read: an approval relayed before the restart sits
-    # behind the replay cursor, and a gateway without cursor replay never re-sends it at all.
-    probed = False
-    while True:
-        if cancel_event.is_set():
-            put_gateway_event("cancel", {"message": "Cancelled by user"})
-            return None, {}
-        if streaming and probed:
-            try:
-                with _open_gateway_run_events(base_url, _gateway_run_headers(session_id, api_key), run_id, last_seq[0]) as resp:
-                    text, usage, outcome, _accepted = _relay_gateway_run_events(
-                        resp, session_id, stream_id, run_id, base_url, api_key,
-                        put_gateway_event=put_gateway_event, cancel_event=cancel_event,
-                        on_seq=lambda seq: last_seq.__setitem__(0, seq), final_text=LiveTurnSnapshot(stream_id).text,
-                        stop_on_truncated=True, surfaced_approval_ids=surfaced_approval_ids,
-                        output_is_authoritative=True, approval_is_current=approval_is_current,
-                    )
-                if outcome == "ended":
-                    return text, usage
-                if outcome == "truncated":
-                    logger.info("Gateway replay for run %s is truncated past seq %s; polling status", run_id, last_seq[0])
-                    streaming = False
-            except urllib.error.HTTPError:
-                streaming = False  # the status poll below classifies 404/401/403
-            except (urllib.error.URLError, OSError, ValueError):
-                logger.debug("Gateway event stream for run %s dropped; checking status", run_id, exc_info=True)
-        first_probe, probed = not probed, True
-        try:
-            status = _get_gateway_run_status(base_url, api_key, run_id)
-            failures = 0
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            code = getattr(exc, "code", None)
-            if code == 404:
-                raise RuntimeError("Gateway no longer has this run; its result could not be recovered after the WebUI restart.") from exc
-            if code in (401, 403):
-                raise RuntimeError(f"Gateway rejected the WebUI credentials (HTTP {code}) while reattaching to a run after the restart.") from exc
-            failures += 1
-            if failures >= GATEWAY_REATTACH_MAX_POLL_FAILURES:
-                raise RuntimeError("Gateway became unreachable while waiting for a run that outlived the WebUI restart.") from exc
-            cancel_event.wait(GATEWAY_REATTACH_POLL_INTERVAL)
-            continue
+    def recover(self, outcome: str):
+        """Arbitrate a lost connection by durable status.
+
+        Returns the turn result when the run is terminal, else ``None`` after
+        pacing (the caller reconnects from the checkpoint).
+        """
+        status = self.probe()
+        if status is None:
+            return None  # probe failed and was paced; reconnect and probe again
+        self.surface_status_approval(status)
         state = str(status.get("status") or "").strip().lower()
-        surface_parked_approval(status)
         if state in _GATEWAY_RUN_TERMINAL_STATUSES:
-            _relay_gateway_pending_steer(session_id, status, put_gateway_event)
-            settle_gateway_pending_run(session_id, run_id, reason=f"Gateway run {state} before approval resolution")
-            if state == "cancelled":
-                # Persist before emit (same round-3 should-fix as the
-                # streaming watchdog's status lane): the browser refetches on
-                # this event, so the cancelled-turn settle must have landed.
-                _settle_gateway_cancelled_turn(session_id, stream_id)
-                put_gateway_event("cancel", {"message": "Cancelled by gateway"})
-                return None, {}
-            if state != "completed":
-                raise RuntimeError(str(status.get("error") or f"Gateway run {state}"))
-            output = str(status.get("output") or "")
-            if output:
-                LiveTurnSnapshot(stream_id, text="").adopt_text(output)
-            return output, nonzero_usage(status)
-        if not (streaming and first_probe):
-            cancel_event.wait(GATEWAY_REATTACH_POLL_INTERVAL)
+            return self.settle(status, state)
+        self.pace(outcome)
+        return None
+
+    def probe(self) -> dict | None:
+        """Read the durable run status.
+
+        Raises when the run cannot be followed: rejected credentials, a
+        repeated 404 (the Gateway has no record of the run; one immediate
+        re-probe covers a status-before-registration race) or an exhausted
+        transport-failure budget. Returns None after pacing a transient
+        failure.
+        """
+        for _attempt in range(_STATUS_404_GRACE_PROBES):
+            try:
+                status = _get_gateway_run_status(self.base_url, self.api_key, self.run_id)
+            except urllib.error.HTTPError as exc:
+                if exc.code in (401, 403):
+                    raise RuntimeError(
+                        f"Gateway rejected the WebUI credentials (HTTP {exc.code}) while following run {self.run_id}"
+                    ) from exc
+                if exc.code == 404:
+                    self.status_404_streak += 1
+                    if self.status_404_streak >= _STATUS_404_GRACE_PROBES:
+                        raise RuntimeError(
+                            "Gateway no longer has the run; its result could not be recovered"
+                        ) from exc
+                    if self.cancel_event.is_set():
+                        return None
+                    continue
+                self._probe_failed(exc)
+                return None
+            except (urllib.error.URLError, OSError, ValueError) as exc:
+                self._probe_failed(exc)
+                return None
+            self.probe_failures = 0
+            self.status_404_streak = 0
+            return status
+        return None
+
+    def _probe_failed(self, exc) -> None:
+        # A probe failure is not proof the run is gone: retry within budget.
+        self.probe_failures += 1
+        self.status_404_streak = 0
+        if self.probe_failures >= GATEWAY_REATTACH_MAX_POLL_FAILURES:
+            raise RuntimeError("Gateway became unreachable while waiting for the run to finish") from exc
+        self.cancel_event.wait(GATEWAY_REATTACH_POLL_INTERVAL)
+
+    def surface_status_approval(self, status: dict) -> None:
+        """Surface the approval a ``waiting_for_approval`` status is parked on, once.
+
+        The status carries only one pending approval. While the events replay
+        can still deliver the queue in order, surfacing it ahead of the replay
+        would invert FIFO, so a live follower does so only for a prompt with an
+        exact identity (a raw id fenced by a generation or the advertised
+        capability). A resumed follower always does: the previous process's
+        cards are gone and the replay may never re-send them.
+        """
+        approval = _gateway_status_approval(status)
+        if str(status.get("status") or "").strip().lower() != "waiting_for_approval" or not isinstance(approval, dict):
+            return
+        if not self.resumed:
+            from api.config import gateway_supports_approval_identity_v1
+
+            exact = _gateway_prompt_identity(approval) and (
+                type(approval.get("execution_generation")) is int
+                or gateway_supports_approval_identity_v1(self.base_url, self.api_key)
+            )
+            if not exact:
+                return
+        approval_key = _gateway_approval_key(approval)
+        if approval_key and approval_key not in self.surfaced_approval_ids:
+            relayed = _relay_gateway_run_approval(
+                self.session_id, self.run_id, approval, self.base_url, self.api_key,
+                put_gateway_event=self.put_gateway_event,
+            )
+            # Register only after a successful relay: a rejected payload must
+            # not suppress a later, well-formed replay of the same approval.
+            if relayed:
+                self.surfaced_approval_ids.add(approval_key)
+
+    def settle(self, status: dict, state: str):
+        """Settle the turn from a terminal durable status."""
+        from api.route_approvals import settle_gateway_pending_run
+
+        # Same order as the events relay: replay steer text the Gateway accepted
+        # but the run never consumed, then retire parked approvals.
+        _relay_gateway_pending_steer(self.session_id, status, self.put_gateway_event)
+        settle_gateway_pending_run(
+            self.session_id, self.run_id, reason=f"Gateway run {state} before approval resolution",
+        )
+        if state in ("cancelled", "interrupted"):
+            # Persist before emitting: the browser refetches the session on this event.
+            _settle_gateway_cancelled_turn(self.session_id, self.stream_id)
+            self.put_gateway_event("cancel", {"message": "Cancelled by gateway"})
+            return None, self.usage
+        if state != "completed":
+            raise RuntimeError(str(status.get("error") or f"Gateway run {state}"))
+        # Final answer: the durable output when non-empty, else what streamed.
+        output = str(status.get("output") or "") or self.checkpoint.text or LiveTurnSnapshot.partial_text(self.stream_id)
+        if output:
+            self.checkpoint.snapshot.adopt_text(output)
+        self.usage.update(nonzero_usage(status))
+        return self.checkpoint.text, self.usage
+
+    def pace(self, outcome: str) -> None:
+        """Wait before reconnecting after a non-terminal arbitration (Stop interrupts every wait)."""
+        if outcome == "resume":
+            return  # first recovery of a resumed run: stream right away
+        if outcome in ("unreachable", "poll"):
+            self.cancel_event.wait(GATEWAY_REATTACH_POLL_INTERVAL)
+            return
+        # A clean EOF (or stall) reconnects with an exponential backoff, so a
+        # gateway or proxy that closes every connection immediately cannot
+        # hot-loop this thread; progress on a connection resets it. The
+        # exponent is bounded before multiplying (no float overflow).
+        self.clean_eof_reconnects += 1
+        self.cancel_event.wait(min(
+            _CLEAN_EOF_BACKOFF_BASE_SECS * (2 ** min(self.clean_eof_reconnects - 1, 6)),
+            _CLEAN_EOF_BACKOFF_MAX_SECS,
+        ))
 
 
 def resume_gateway_runs_after_restart() -> list[str]:
@@ -2239,6 +2106,29 @@ def _resume_gateway_run_for_session(session) -> bool:
         return False
     return True
 
+def _restore_sealed_commentary(session, stream_id) -> None:
+    """Restore this turn's sealed interim commentary from the run journal.
+
+    The one place every Gateway turn outcome (completed, failed, cancelled)
+    rebuilds the commentary segments the browser saw: the journal is the
+    source, rows are display-only (process prose never enters model context),
+    and dedup is limited to the current turn (after its last user row). The
+    open segment after the last interim boundary is not restored here; each
+    outcome writes it itself (final answer, partial or error suffix).
+    """
+    from api.models import _append_journaled_partial_output
+
+    turn_start = next((
+        i + 1 for i in range(len(session.messages) - 1, -1, -1)
+        if session.messages[i].get("role") == "user"
+    ), len(session.messages))
+    _append_journaled_partial_output(
+        session, stream_id, dedupe_existing=True,
+        dedupe_min_index=turn_start, append_context=False,
+        display_only=True, through_last_interim=True,
+    )
+
+
 def _settle_gateway_terminal_error(
     session_id,
     stream_id,
@@ -2275,19 +2165,9 @@ def _settle_gateway_terminal_error(
             )
         turn_duration = _terminal_turn_duration(session)
         _materialize_pending_user_turn_before_error(session)
-        # Recover sealed commentary before the open suffix and error marker,
-        # while the pending turn still owns the journal output.
-        from api.models import _append_journaled_partial_output
-
-        turn_start = next((
-            i + 1 for i in range(len(session.messages) - 1, -1, -1)
-            if session.messages[i].get("role") == "user"
-        ), len(session.messages))
-        _append_journaled_partial_output(
-            session, stream_id, dedupe_existing=True,
-            dedupe_min_index=turn_start, append_context=False,
-            display_only=True, through_last_interim=True,
-        )
+        # Before the open suffix and error marker, while the pending turn
+        # still owns the journal output.
+        _restore_sealed_commentary(session, stream_id)
         session.active_stream_id = None
         session.gateway_run = None
         session.pending_user_message = None
@@ -2411,19 +2291,9 @@ def _settle_gateway_cancelled_turn(session_id, stream_id) -> None:
             stream_id,
             partial_ts=partial_msg.get("timestamp") if partial_msg is not None else None,
         )
-        # Seed/reconcile model context first, then restore display-only sealed
-        # commentary ahead of the open suffix without clearing turn ownership.
-        from api.models import _append_journaled_partial_output
-
-        turn_start = next((
-            i + 1 for i in range(len(session.messages) - 1, -1, -1)
-            if session.messages[i].get("role") == "user"
-        ), len(session.messages))
-        _append_journaled_partial_output(
-            session, stream_id, dedupe_existing=True,
-            dedupe_min_index=turn_start, append_context=False,
-            display_only=True, through_last_interim=True,
-        )
+        # Seed/reconcile model context first, then restore sealed commentary
+        # ahead of the open suffix without clearing turn ownership.
+        _restore_sealed_commentary(session, stream_id)
         if partial_msg is not None:
             if not isinstance(session.messages, list):
                 session.messages = []
@@ -3151,7 +3021,6 @@ def _run_gateway_chat_streaming(
                         session_id, stream_id, run_id, base_url, api_key,
                         put_gateway_event=put_gateway_event,
                         cancel_event=cancel_event,
-                        resume_seq=LiveTurnSnapshot.restore(session_id, stream_id),
                     )
                 else:
                     final_text, usage = _run_gateway_runs_api_streaming(
@@ -3411,22 +3280,10 @@ def _run_gateway_chat_streaming(
                             display = display[:-1]
                 s.messages = display + [user_msg, assistant_msg]
             if _use_runs_api and s.messages and s.messages[-1].get("content") == assistant_text:
-                # The journal is also the browser replay source. Persist its
-                # sealed commentary with the SAME segment/dedup rules, before
-                # the final row, without adding process prose to model history.
-                from api.models import _append_journaled_partial_output
-
+                # Sealed commentary goes before the final row.
                 final_display = s.messages.pop()
-                turn_start = next((
-                    i + 1 for i in range(len(s.messages) - 1, -1, -1)
-                    if s.messages[i].get("role") == "user"
-                ), len(s.messages))
                 try:
-                    _append_journaled_partial_output(
-                        s, stream_id, dedupe_existing=True,
-                        dedupe_min_index=turn_start, append_context=False,
-                        display_only=True, through_last_interim=True,
-                    )
+                    _restore_sealed_commentary(s, stream_id)
                 finally:
                     s.messages.append(final_display)
             if active_turn_identity.get("token"):

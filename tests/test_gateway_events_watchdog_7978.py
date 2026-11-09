@@ -1495,16 +1495,16 @@ def test_r6_rejected_status_approval_payload_does_not_mask_replay():
     assert approvals[0]["command"] == "ls -la /tmp", approvals[0]
 
 
-def test_r4_settle_flow_has_single_continue_branch():
-    """Round-4 Greptile item 6: the duplicated dead ``if action == "continue":``
-    block (a porting artifact — the first branch always continued) is gone and
-    the settle flow is linear. The duplicate was unreachable, so no behavioral
-    trace can show it; this pins the source structure instead."""
+def test_live_and_resumed_turns_share_one_recovery_procedure():
+    """Every lost connection, live or after a restart, is arbitrated by the same
+    follower: both entry points delegate to ``_GatewayRunFollower`` and neither
+    keeps a private consume/poll loop."""
     import inspect
-    src = inspect.getsource(gc._run_gateway_runs_api_streaming)
-    count = src.count('action == "continue"')
-    assert count == 1, (
-        f"the settle flow must have exactly one continue branch, found {count}")
+    for entry in (gc._run_gateway_runs_api_streaming, gc._await_gateway_run_result):
+        src = inspect.getsource(entry)
+        assert "_GatewayRunFollower(" in src
+        assert "while True" not in src
+        assert "_get_gateway_run_status" not in src
 
 
 def test_r4_cancel_marker_scan_stops_at_turn_boundary():
