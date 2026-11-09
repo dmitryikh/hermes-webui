@@ -12,6 +12,8 @@ import pytest
 
 from tests.test_session_reasoning_effort import isolated_reasoning_profiles, external_root_with_named_active  # noqa: F401
 from api import config, models, gateway_chat, profiles
+from api import gateway_transport_chat as gateway_chat_transport
+from api import gateway_transport
 
 
 def _posted_urls(session, tmp_path, monkeypatch):
@@ -19,8 +21,8 @@ def _posted_urls(session, tmp_path, monkeypatch):
     session.pending_user_message = "hello"
     models.SESSIONS[session.session_id] = session
     monkeypatch.setitem(config.STREAMS, session.active_stream_id, config.create_stream_channel())
-    monkeypatch.setattr(gateway_chat, "gateway_supports_approval", lambda *args: True)
-    monkeypatch.setattr(gateway_chat, "gateway_approval_unavailable_reason", lambda *args: None)
+    monkeypatch.setattr(gateway_transport, "gateway_supports_approval", lambda *args: True)
+    monkeypatch.setattr(gateway_chat_transport, "gateway_approval_unavailable_reason", lambda *args: None)
     posted = []
 
     def urlopen(request, timeout=None):

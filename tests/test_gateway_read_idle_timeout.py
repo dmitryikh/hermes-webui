@@ -22,10 +22,10 @@ real socket semantics rather than a stateless re-raise.
 import socket
 import threading
 
-from api.gateway_chat import (
-    _GATEWAY_READ_TIMEOUT_DEFAULT,
-    _gateway_read_timeout_secs,
-    _iter_sse_lines_cancellable,
+from api.gateway_sse import (
+    READ_TIMEOUT_DEFAULT as _GATEWAY_READ_TIMEOUT_DEFAULT,
+    iter_lines_cancellable as _iter_sse_lines_cancellable,
+    read_timeout_secs as _gateway_read_timeout_secs,
 )
 
 

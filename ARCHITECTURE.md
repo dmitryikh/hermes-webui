@@ -59,6 +59,15 @@ actions. The topbar remains focused on conversation context and the workspace/fi
       agent_compat.py      Resolver for Hermes Agent names moved to sibling modules (compatibility-only)
       auth.py              Optional password authentication, signed cookies, passkeys/WebAuthn
       config.py            Discovery, globals, model detection, reloadable config
+      gateway_sse.py       Gateway bridge layer 1: SSE line framing, read-timeout budget, Stop-aware reads
+      gateway_events.py    Gateway bridge layer 2: typed Hermes events + one decoder per wire dialect
+      gateway_projection.py Gateway bridge layer 3: Gateway events -> WebUI events + live reconnect snapshot
+      gateway_transport.py Gateway transport abstraction: GatewayTurn, TurnResult, GatewayTransport, selection
+      gateway_transport_chat.py Chat Completions transport (stateless /v1/chat/completions stream)
+      gateway_transport_runs.py Runs API transport (durable /v1/runs, reconnect/watchdog, reattach)
+      gateway_sessions.py  Session-protocol transport (canonical sessions over the profile's private socket)
+      gateway_chat.py      Gateway turn lifecycle: admission, journal, transport selection, settlement,
+                           teardown; shared approval and run-lifecycle services for the transports
       helpers.py           HTTP helpers: j(), bad(), require(), safe_resolve(), security headers
       goals.py             Persistent-goal commands and profile-scoped native GoalManager bridge
       models.py            Session model + CRUD, per-session profile/model/reasoning tracking, CLI/state.db bridge
@@ -397,6 +406,77 @@ on_tool callback:
 
 The approval surface-on-tool logic means approvals appear immediately after the tool
 fires (within the same SSE stream), without waiting for the next poll cycle.
+
+#### Gateway-backed turns (`HERMES_WEBUI_CHAT_BACKEND=gateway`)
+
+A Gateway-backed turn keeps the same browser contract, but its events come from
+the Hermes Gateway. `_run_gateway_chat_streaming` (`api/gateway_chat.py`) owns the
+transport-independent lifecycle — stream admission, run journal, session/profile
+resolution, prefill and request options, settlement of the outcome (cancelled,
+failed, empty, success writeback, goal hook, `done`) and teardown. The only
+transport-specific step is `transport.run(GatewayTurn) -> TurnResult`
+(`api/gateway_transport.py`), with three implementations:
+
+| Transport | Module | When | Run identity |
+|---|---|---|---|
+| `ChatCompletionsTransport` | `gateway_transport_chat.py` | default | none: no reattach, remote Stop or Steer |
+| `RunsApiTransport` | `gateway_transport_runs.py` | Runs API enabled and the Gateway relays approvals, or a reattached run | durable run id; reconnect and reattach |
+| `SessionProtocolTransport` | `gateway_sessions.py` | an external session opted into `webui_gateway_session_transport` | canonical session admission |
+
+A transport reports cancellation as `text=None`, failure as `error` or any
+exception, and an unknown outcome as `TurnOutcomeUnknown` (the pending turn is
+preserved). Inside the transports, each processing level lives in its own module
+and talks to the next level only through its output type:
+
+    HTTP response bytes
+      -> api/gateway_sse.py         iter_sse_frames()         -> SseFrame(event, data)
+      -> api/gateway_events.py      decode_runs_frame()        -> GatewayFrame(seq, events)
+                                    decode_chat_completion_frame()
+                                    decode_session_event()     (JSON-RPC session lane)
+      -> api/gateway_projection.py  GatewayEventProjector      -> WebUI event (journaled
+                                                                  + queued) and
+                                                                  LiveTurnSnapshot update
+      -> transport                  connection, approvals, terminal events
+                                    (Runs API: reconnect, watchdog, durable status)
+      -> api/gateway_chat.py        transport-independent settlement of the turn
+
+- Layer 1 knows SSE grammar and read timeouts only; layer 2 is pure decoding
+  into typed events (`TextDelta`, `ReasoningDelta`, `ToolProgress`,
+  `InterimMessage`, `ApprovalRequest`, `UsageReport`, `RunCompleted`, ...);
+  layer 3 owns the stream's reconnect snapshot rows
+  (`STREAM_PARTIAL_TEXT`, `STREAM_REASONING_TEXT`, `STREAM_LIVE_TOOL_CALLS`).
+- Control events (approvals, terminal run events, replay truncation) are not
+  projected: their side effects belong to the transport and the shared approval
+  services in `gateway_chat.py`.
+- Layer 2 decodes only the shapes the current Hermes Agent API server emits
+  (`gateway/platforms/api_server_runs.py`, `api_server_openai_routes.py`,
+  `gateway/run_turn_progress.py`): Runs API `_run_event` envelopes named by
+  `event`; Chat Completions chunks (`delta.content`, `delta.reasoning_content`,
+  finish usage/`error`) plus the named `hermes.tool.progress` and
+  `approval.request` events; session-protocol `message.delta`,
+  `reasoning.delta`/`thinking.delta` and `tool.start`/`tool.complete`. Approval
+  prompts are identified by `request_id` (in-process) or `prompt_id` +
+  `execution_generation` (session authority); a prompt without an id is not
+  surfaced.
+- Invariant: every snapshot update comes from the same projection that emits
+  the journaled WebUI event, so the snapshot is the fold of the journal.
+  `TurnCheckpoint.restore()` rebuilds it after a WebUI restart by folding
+  the journal with the same `LiveTurnSnapshot.apply()`.
+
+Recovery is one procedure for every Runs API turn. A `TurnCheckpoint` (the
+Gateway cursor of the last relayed frame plus the snapshot it produced) is the
+only resume state: the relay updates it in place frame by frame, so a dying
+connection loses nothing. `_GatewayRunFollower` (`api/gateway_transport_runs.py`) follows the run from a
+checkpoint, and every lost connection — read timeout, reset, HTTP error, clean
+EOF, watchdog stall, WebUI restart — goes through its `recover()`: probe the
+durable run status, surface a parked approval, settle a terminal run from the
+status, otherwise pace and reconnect `/events` from the checkpoint cursor.
+A live turn starts from a fresh checkpoint; a turn that outlived the WebUI
+process starts from `TurnCheckpoint.restore()` and begins with `recover()`.
+A checkpoint without a trustworthy cursor (unreadable journal, snapshot rows
+without `gateway_seq`) follows the run by status only. When the turn ends,
+`_restore_sealed_commentary()` is the one place its sealed interim commentary
+is rebuilt from the journal, for completed, failed and cancelled outcomes alike.
 
 ### 4.5 Approval System Integration
 

@@ -153,8 +153,10 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import api.config as _config  # noqa: E402
 import api.gateway_chat as gc  # noqa: E402
-from api.gateway_chat import GATEWAY_REATTACH_MAX_POLL_FAILURES, GATEWAY_REATTACH_POLL_INTERVAL  # noqa: E402
+from api import gateway_transport_runs as gateway_runs  # noqa: E402
+from api.gateway_transport_runs import GATEWAY_REATTACH_MAX_POLL_FAILURES, GATEWAY_REATTACH_POLL_INTERVAL  # noqa: E402
 
 BASE_URL = "http://gateway.test"
 STREAM_ID = "watchdog-harness-stream"
@@ -427,28 +429,34 @@ def run_turn(*, urlopen_script=(), status_script=(), cancel_event=None, clock=No
             return fn(*a, **k)
         return call
 
-    patch(gc, "time", types.SimpleNamespace(monotonic=clock.monotonic))
-    patch(gc, "_admit_gateway_run", lambda *a, **k: RUN_ID)
-    patch(gc, "_get_gateway_run_status", traced("status", status))
-    patch(gc, "_settle_gateway_cancelled_turn", traced_cancel_settle)
-    patch(urllib.request, "urlopen", traced("events", urlopen))
-    for obj, name, value in extra_patches:
-        patch(obj, name, value)
-
     import api.route_approvals as ra
 
     def fake_settle(session_key, run_id, *, reason):
         settles.append(reason)
         return 0, None, 0
 
-    patch(ra, "settle_gateway_pending_run", fake_settle)
+    try:
+        patch(gateway_runs, "time", types.SimpleNamespace(monotonic=clock.monotonic))
+        patch(gateway_runs, "_admit_gateway_run", lambda *a, **k: RUN_ID)
+        patch(gateway_runs, "_get_gateway_run_status", traced("status", status))
+        patch(gc, "_settle_gateway_cancelled_turn", traced_cancel_settle)
+        patch(urllib.request, "urlopen", traced("events", urlopen))
+        for obj, name, value in extra_patches:
+            patch(obj, name, value)
+        patch(ra, "settle_gateway_pending_run", fake_settle)
+    except BaseException:
+        # A patch that cannot be applied must not leak the ones already applied
+        # (a leaked fake ``time`` breaks every later Gateway test).
+        for obj, name, value in reversed(saved):
+            setattr(obj, name, value)
+        raise
 
-    gc.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
+    _config.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
     saved_log_level = gc.logger.level
     gc.logger.setLevel(logging.CRITICAL)
     try:
         try:
-            result = gc._run_gateway_runs_api_streaming(
+            result = gateway_runs._run_gateway_runs_api_streaming(
                 "sess-watchdog-harness", "hi", "test-model", "/tmp", STREAM_ID,
                 BASE_URL, "test-key", [], {},
                 put_gateway_event=lambda name, payload: events.append((name, payload)),
@@ -461,7 +469,7 @@ def run_turn(*, urlopen_script=(), status_script=(), cancel_event=None, clock=No
         gc.logger.setLevel(saved_log_level)
         for obj, name, value in reversed(saved):
             setattr(obj, name, value)
-        gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+        _config.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
     return {
         "result": result,
         "events": events,
@@ -791,16 +799,16 @@ def test_stop_between_grace_probes_surfaces_cancel_without_reconnect():
         setattr(obj, name, value)
 
     events = []
-    patch(gc, "time", types.SimpleNamespace(monotonic=clock.monotonic))
-    patch(gc, "_admit_gateway_run", lambda *a, **k: RUN_ID)
-    patch(gc, "_get_gateway_run_status", status_after_stop)
+    patch(gateway_runs, "time", types.SimpleNamespace(monotonic=clock.monotonic))
+    patch(gateway_runs, "_admit_gateway_run", lambda *a, **k: RUN_ID)
+    patch(gateway_runs, "_get_gateway_run_status", status_after_stop)
     patch(urllib.request, "urlopen", urlopen)
     import api.route_approvals as ra
 
     patch(ra, "settle_gateway_pending_run", lambda *a, **k: (0, None, 0))
-    gc.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
+    _config.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
     try:
-        result = gc._run_gateway_runs_api_streaming(
+        result = gateway_runs._run_gateway_runs_api_streaming(
             "sess-watchdog-harness", "hi", "test-model", "/tmp", STREAM_ID,
             BASE_URL, "test-key", [], {},
             put_gateway_event=lambda name, payload: events.append((name, payload)),
@@ -809,7 +817,7 @@ def test_stop_between_grace_probes_surfaces_cancel_without_reconnect():
     finally:
         for obj, name, value in reversed(saved):
             setattr(obj, name, value)
-        gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+        _config.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
 
     assert result[0] is None, f"Stop between the probes must cancel, got {result!r}"
     assert any(name == "cancel" for name, _ in events), f"events={events!r}"
@@ -901,7 +909,7 @@ def test_r5_run_completed_breaks_out_of_infinite_postterminal_keepalives():
             "description": "Dangerous command approval",
             "pattern_key": "dangerous_command",
             "pattern_keys": ["dangerous_command"],
-            "choices": ["once", "always"], "approval_id": "appr-r5-1",
+            "choices": ["once", "always"], "request_id": "appr-r5-1",
         })
         + sse_frame(2, {"event": "message.delta", "delta": "streamed "})
         + sse_frame(3, {
@@ -921,7 +929,6 @@ def test_r5_run_completed_breaks_out_of_infinite_postterminal_keepalives():
         extra_patches=[
             (gc, "_settle_gateway_run_approval",
              lambda *a, **k: approval_settles.append(k) or (True, {"approval_id": "appr-r5-1"}, 0)),
-            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: False),
         ],
         on_seq=committed_seqs.append,
     )
@@ -954,8 +961,8 @@ def test_r5_event_header_framed_terminal_frame_breaks_out_of_keepalives():
 
     clock = FakeClock()
     stream = InfiniteKeepaliveSseResponse(
-        [b"event: message.delta", b"data: " + json.dumps({"delta": "streamed "}).encode(), b""]
-        + [b"event: run.completed", b"data: " + json.dumps({"output": "Hello"}).encode(), b""],
+        [b"event: message.delta", b"data: " + json.dumps({"event": "message.delta", "delta": "streamed "}).encode(), b""]
+        + [b"event: run.completed", b"data: " + json.dumps({"event": "run.completed", "output": "Hello"}).encode(), b""],
         clock=clock, advance_per_line=60.0,
     )
     harness = run_turn(
@@ -966,7 +973,6 @@ def test_r5_event_header_framed_terminal_frame_breaks_out_of_keepalives():
             {"status": "completed", "output": "status-poll-text"},
         ],
         extra_patches=[
-            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: False),
         ],
     )
     result = harness["result"]
@@ -1077,8 +1083,8 @@ def test_r4_stop_during_byte_silence_cancels_within_budget():
 
 def test_r4_status_waiting_for_approval_surfaces_approval_card_once():
     """Round-4 Greptile item 4, identity-gateway contract (round-4 maintainer
-    must-fix): on a gateway advertising ``approval_identity_v1``, a durable
-    status of ``waiting_for_approval`` carrying the approval payload surfaces
+    must-fix): for a generation-fenced prompt, a durable status of
+    ``waiting_for_approval`` carrying the approval payload surfaces
     the card exactly once (mirroring the reattach path's parked-approval
     surface), even when the events feed never delivered it. A re-probe
     carrying the same approval key must NOT double-card, and a later
@@ -1089,7 +1095,8 @@ def test_r4_status_waiting_for_approval_surfaces_approval_card_once():
 
     clock = FakeClock()
     approval_payload = {
-        "approval_id": "appr-r4-1",
+        "prompt_id": "appr-r4-1",
+        "execution_generation": 1,
         "tool": "shell",
         "command": "ls -la /tmp",
         "description": "list files",
@@ -1116,7 +1123,6 @@ def test_r4_status_waiting_for_approval_surfaces_approval_card_once():
             # identity gateway: the raw approval_id carries the exact-id
             # status-card recovery; the patch also keeps the capability
             # probe off the scripted urlopen wire
-            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: True),
         ],
     )
     result = harness["result"]
@@ -1173,7 +1179,6 @@ def test_r4_status_card_survives_without_capability_when_payload_carries_generat
             {"status": "waiting_for_approval", "approval": dict(approval_payload)},
         ],
         extra_patches=[
-            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: False),
         ],
     )
     result = harness["result"]
@@ -1233,7 +1238,6 @@ def test_r4_status_card_reads_the_canonical_pending_controls_projection():
         ],
         status_script=[projection, projection],
         extra_patches=[
-            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: False),
         ],
     )
     result = harness["result"]
@@ -1280,7 +1284,6 @@ def test_r8_republished_generation_is_relayed_again():
         ],
         status_script=[],
         extra_patches=[
-            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: False),
             (gc, "_settle_gateway_run_approval", fake_settle),
         ],
     )
@@ -1306,10 +1309,17 @@ def _generation_fenced_approval_frame(seq, prompt_id, generation, command):
     })
 
 
-def _approval_request_frame(seq, appr_id, command):
+def _identity(appr_id, generation):
+    """In-process approvals carry ``request_id``; fenced prompts ``prompt_id`` + generation."""
+    if generation is None:
+        return {"request_id": appr_id}
+    return {"prompt_id": appr_id, "execution_generation": generation}
+
+
+def _approval_request_frame(seq, appr_id, command, generation=None):
     return sse_frame(seq, {
         "event": "approval.request",
-        "approval_id": appr_id,
+        **_identity(appr_id, generation),
         "tool": "shell",
         "command": command,
         "description": f"run {command}",
@@ -1320,10 +1330,10 @@ def _approval_request_frame(seq, appr_id, command):
     })
 
 
-def _pending_approval_payload(appr_id, command):
+def _pending_approval_payload(appr_id, command, generation=None):
     """Durable-status shape of one parked approval."""
     return {
-        "approval_id": appr_id,
+        **_identity(appr_id, generation),
         "tool": "shell",
         "command": command,
         "description": f"run {command}",
@@ -1375,7 +1385,6 @@ def test_r6_status_approval_mirror_skipped_without_identity_fifo_replay_orders_a
              "approval": _pending_approval_payload("appr-B", "rm -rf /tmp/x")},
         ],
         extra_patches=[
-            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: False),
             (gc, "_settle_gateway_run_approval", fake_settle),
         ],
     )
@@ -1386,58 +1395,6 @@ def test_r6_status_approval_mirror_skipped_without_identity_fifo_replay_orders_a
                  if name == "approval"]
     assert approvals == ["appr-A", "appr-B"], (
         f"FIFO queue order must be preserved by the replay (A -> B), got {approvals}")
-    assert harness["status"].calls == 2, harness["trace"]
-
-
-def test_r6_identity_gateway_status_card_from_status_deduped_against_replay():
-    """Maintainer round-4 must-fix, identity-gateway variant: the exact-id
-    status-card recovery is KEPT. With ``approval_identity_v1`` advertised
-    and a raw approval id on the payload, the stalled probe surfaces B's
-    card from status, the replay then delivers A (surfaced) and B (deduped
-    by exact id) — each approval cards exactly once. (Not red by design:
-    pins the preserved behavior.)"""
-    import api.config as api_config
-
-    clock = FakeClock()
-
-    def fake_settle(*args, **kwargs):
-        return False, None, 1
-
-    harness = run_turn(
-        clock=clock,
-        urlopen_script=[
-            FakeSseResponse(keepalive() * 4, end="eof", clock=clock, advance_per_line=60.0),
-            FakeSseResponse(
-                _approval_request_frame(1, "appr-A", "echo first")
-                + _approval_request_frame(2, "appr-B", "rm -rf /tmp/x")
-                + keepalive() * 4,
-                end="eof", clock=clock, advance_per_line=60.0,
-            ),
-            FakeSseResponse(
-                sse_frame(0, {"event": "run.completed", "output": "done after approvals"}),
-                end="eof",
-            ),
-        ],
-        status_script=[
-            {"status": "waiting_for_approval",
-             "approval": _pending_approval_payload("appr-B", "rm -rf /tmp/x")},
-            {"status": "waiting_for_approval",
-             "approval": _pending_approval_payload("appr-B", "rm -rf /tmp/x")},
-        ],
-        extra_patches=[
-            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: True),
-            (gc, "_settle_gateway_run_approval", fake_settle),
-        ],
-    )
-    result = harness["result"]
-    assert result[0] == "done after approvals", (
-        f"run must finalize after the approval lane, got {result!r}")
-    approvals = [payload["approval_id"] for name, payload in harness["events"]
-                 if name == "approval"]
-    assert sorted(approvals) == ["appr-A", "appr-B"], (
-        f"each approval must card exactly once, got {approvals}")
-    assert approvals.count("appr-B") == 1, (
-        f"the status card must be deduped against the replay, got {approvals}")
     assert harness["status"].calls == 2, harness["trace"]
 
 
@@ -1463,7 +1420,7 @@ def test_r6_rejected_status_approval_payload_does_not_mask_replay():
             FakeSseResponse(keepalive() * 4, end="eof", clock=clock, advance_per_line=60.0),
             # reconnect: the replay delivers the FULL approval, then stalls
             FakeSseResponse(
-                _approval_request_frame(1, "appr-1", "ls -la /tmp")
+                _approval_request_frame(1, "appr-1", "ls -la /tmp", generation=1)
                 + keepalive() * 4,
                 end="eof", clock=clock, advance_per_line=60.0,
             ),
@@ -1474,13 +1431,12 @@ def test_r6_rejected_status_approval_payload_does_not_mask_replay():
         ],
         status_script=[
             {"status": "waiting_for_approval",
-             "approval": {"approval_id": "appr-1", "tool": "", "command": "",
-                          "description": ""}},
+             "approval": {"prompt_id": "appr-1", "execution_generation": 1, "tool": "",
+                          "command": "", "description": ""}},
             {"status": "waiting_for_approval",
-             "approval": _pending_approval_payload("appr-1", "ls -la /tmp")},
+             "approval": _pending_approval_payload("appr-1", "ls -la /tmp", generation=1)},
         ],
         extra_patches=[
-            (api_config, "gateway_supports_approval_identity_v1", lambda *a, **k: True),
             (gc, "_settle_gateway_run_approval", fake_settle),
         ],
     )
@@ -1494,16 +1450,16 @@ def test_r6_rejected_status_approval_payload_does_not_mask_replay():
     assert approvals[0]["command"] == "ls -la /tmp", approvals[0]
 
 
-def test_r4_settle_flow_has_single_continue_branch():
-    """Round-4 Greptile item 6: the duplicated dead ``if action == "continue":``
-    block (a porting artifact — the first branch always continued) is gone and
-    the settle flow is linear. The duplicate was unreachable, so no behavioral
-    trace can show it; this pins the source structure instead."""
+def test_live_and_resumed_turns_share_one_recovery_procedure():
+    """Every lost connection, live or after a restart, is arbitrated by the same
+    follower: both entry points delegate to ``_GatewayRunFollower`` and neither
+    keeps a private consume/poll loop."""
     import inspect
-    src = inspect.getsource(gc._run_gateway_runs_api_streaming)
-    count = src.count('action == "continue"')
-    assert count == 1, (
-        f"the settle flow must have exactly one continue branch, found {count}")
+    for entry in (gateway_runs._run_gateway_runs_api_streaming, gateway_runs._await_gateway_run_result):
+        src = inspect.getsource(entry)
+        assert "_GatewayRunFollower(" in src
+        assert "while True" not in src
+        assert "_get_gateway_run_status" not in src
 
 
 def test_r4_cancel_marker_scan_stops_at_turn_boundary():
@@ -1524,9 +1480,9 @@ def test_r4_cancel_marker_scan_stops_at_turn_boundary():
     models.SESSION_DIR = pathlib.Path(tmp)
     models.SESSION_INDEX_FILE = pathlib.Path(tmp) / "_index.json"
     models.SESSIONS.clear()
-    saved_partial = gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
-    saved_reasoning = gc.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
-    saved_tools = gc.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
+    saved_partial = _config.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+    saved_reasoning = _config.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
+    saved_tools = _config.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
     try:
         sid = "sess-watchdog-marker-boundary"
         session = models.Session(session_id=sid, title="Watchdog Harness", messages=[
@@ -1542,9 +1498,9 @@ def test_r4_cancel_marker_scan_stops_at_turn_boundary():
         session.save()
         models.SESSIONS[sid] = session
 
-        gc.STREAM_PARTIAL_TEXT[STREAM_ID] = "second partial answer"
-        gc.STREAM_REASONING_TEXT[STREAM_ID] = ""
-        gc.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = []
+        _config.STREAM_PARTIAL_TEXT[STREAM_ID] = "second partial answer"
+        _config.STREAM_REASONING_TEXT[STREAM_ID] = ""
+        _config.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = []
         gc._settle_gateway_cancelled_turn(sid, STREAM_ID)
 
         models.SESSIONS.pop(sid, None)
@@ -1563,15 +1519,15 @@ def test_r4_cancel_marker_scan_stops_at_turn_boundary():
         assert rows[3]["content"] == "second prompt", rows[3]
         assert rows[4]["content"] == "second partial answer", rows[4]
     finally:
-        gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
-        gc.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
-        gc.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
+        _config.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+        _config.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
+        _config.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
         if saved_partial is not None:
-            gc.STREAM_PARTIAL_TEXT[STREAM_ID] = saved_partial
+            _config.STREAM_PARTIAL_TEXT[STREAM_ID] = saved_partial
         if saved_reasoning is not None:
-            gc.STREAM_REASONING_TEXT[STREAM_ID] = saved_reasoning
+            _config.STREAM_REASONING_TEXT[STREAM_ID] = saved_reasoning
         if saved_tools is not None:
-            gc.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = saved_tools
+            _config.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = saved_tools
         models.SESSION_DIR, models.SESSION_INDEX_FILE = saved_dir, saved_index
         models.SESSIONS.clear()
         models.SESSIONS.update(saved_sessions)
@@ -1635,18 +1591,18 @@ def test_r4_status_lane_cancel_persists_before_cancel_event():
                 refetch_at_event.append(
                     (len(partials), partials[0].get("content") if partials else None))
 
-        patch(gc, "time", types.SimpleNamespace(monotonic=clock.monotonic))
-        patch(gc, "_admit_gateway_run", lambda *a, **k: RUN_ID)
-        patch(gc, "_get_gateway_run_status", status)
+        patch(gateway_runs, "time", types.SimpleNamespace(monotonic=clock.monotonic))
+        patch(gateway_runs, "_admit_gateway_run", lambda *a, **k: RUN_ID)
+        patch(gateway_runs, "_get_gateway_run_status", status)
         patch(urllib.request, "urlopen", urlopen)
         import api.route_approvals as ra
 
         patch(ra, "settle_gateway_pending_run", lambda *a, **k: (0, None, 0))
-        gc.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
-        gc.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
-        gc.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
+        _config.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
+        _config.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
+        _config.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
         try:
-            result = gc._run_gateway_runs_api_streaming(
+            result = gateway_runs._run_gateway_runs_api_streaming(
                 sid, "hi", "test-model", "/tmp", STREAM_ID,
                 BASE_URL, "test-key", [], {},
                 put_gateway_event=on_event,
@@ -1655,7 +1611,7 @@ def test_r4_status_lane_cancel_persists_before_cancel_event():
         finally:
             for obj, name, value in reversed(saved):
                 setattr(obj, name, value)
-            gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+            _config.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
 
         assert result[0] is None, result
         assert refetch_at_event and refetch_at_event[0] == (1, "partial answer so far"), (
@@ -1670,9 +1626,9 @@ def test_r4_status_lane_cancel_persists_before_cancel_event():
         assert len(partials) == 1 and partials[0].get("content") == "partial answer so far", partials
         assert len(markers) == 1, markers
     finally:
-        gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
-        gc.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
-        gc.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
+        _config.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+        _config.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
+        _config.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
         models.SESSION_DIR, models.SESSION_INDEX_FILE = saved_dir, saved_index
         models.SESSIONS.clear()
         models.SESSIONS.update(saved_sessions)
@@ -1741,17 +1697,17 @@ def test_stop_is_honoured_between_probe_retries():
         setattr(obj, name, value)
 
     events = []
-    patch(gc, "time", types.SimpleNamespace(monotonic=clock.monotonic))
-    patch(gc, "_admit_gateway_run", lambda *a, **k: RUN_ID)
-    patch(gc, "_get_gateway_run_status", status)
+    patch(gateway_runs, "time", types.SimpleNamespace(monotonic=clock.monotonic))
+    patch(gateway_runs, "_admit_gateway_run", lambda *a, **k: RUN_ID)
+    patch(gateway_runs, "_get_gateway_run_status", status)
     patch(urllib.request, "urlopen", urlopen)
 
     import api.route_approvals as ra
 
     patch(ra, "settle_gateway_pending_run", lambda *a, **k: (0, None, 0))
-    gc.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
+    _config.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
     try:
-        result = gc._run_gateway_runs_api_streaming(
+        result = gateway_runs._run_gateway_runs_api_streaming(
             "sess-watchdog-harness", "hi", "test-model", "/tmp", STREAM_ID,
             BASE_URL, "test-key", [], {},
             put_gateway_event=lambda name, payload: events.append((name, payload)),
@@ -1760,7 +1716,7 @@ def test_stop_is_honoured_between_probe_retries():
     finally:
         for obj, name, value in reversed(saved):
             setattr(obj, name, value)
-        gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+        _config.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
 
     assert result[0] is None, "Stop must cancel the turn, not retry the budget"
     assert any(name == "cancel" for name, _ in events), f"events={events!r}"
@@ -1840,24 +1796,24 @@ def test_completed_status_stream_writeback_overwrites_partial_text():
         saved.append((obj, name, getattr(obj, name)))
         setattr(obj, name, value)
 
-    patch(gc, "time", types.SimpleNamespace(monotonic=clock.monotonic))
-    patch(gc, "_admit_gateway_run", lambda *a, **k: RUN_ID)
-    patch(gc, "_get_gateway_run_status", status)
+    patch(gateway_runs, "time", types.SimpleNamespace(monotonic=clock.monotonic))
+    patch(gateway_runs, "_admit_gateway_run", lambda *a, **k: RUN_ID)
+    patch(gateway_runs, "_get_gateway_run_status", status)
     patch(urllib.request, "urlopen", urlopen)
     patch(ra, "settle_gateway_pending_run", lambda *a, **k: (0, None, 0))
-    gc.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
+    _config.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
     try:
-        result = gc._run_gateway_runs_api_streaming(
+        result = gateway_runs._run_gateway_runs_api_streaming(
             "sess-watchdog-harness", "hi", "test-model", "/tmp", STREAM_ID,
             BASE_URL, "test-key", [], {},
             put_gateway_event=lambda name, payload: None,
             cancel_event=FakeCancelEvent(clock),
         )
-        writeback = gc.STREAM_PARTIAL_TEXT.get(STREAM_ID)
+        writeback = _config.STREAM_PARTIAL_TEXT.get(STREAM_ID)
     finally:
         for obj, name, value in reversed(saved):
             setattr(obj, name, value)
-        gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+        _config.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
 
     assert result[0] == "Hello world"
     assert writeback == "Hello world", f"UI writeback must match the adopted output, got {writeback!r}"
@@ -1904,8 +1860,8 @@ def test_status_lane_cancel_persists_partial_reasoning_and_tool_buffers():
     models.SESSION_INDEX_FILE = pathlib.Path(tmp) / "_index.json"
     models.SESSIONS.clear()
     sid = "sess-watchdog-cancel-persist"
-    saved_reasoning = gc.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
-    saved_tools = gc.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
+    saved_reasoning = _config.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
+    saved_tools = _config.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
     try:
         session = models.Session(session_id=sid, title="Watchdog Harness", messages=[])
         session.active_stream_id = STREAM_ID
@@ -1919,9 +1875,9 @@ def test_status_lane_cancel_persists_partial_reasoning_and_tool_buffers():
         # shared partial buffer around the run (as the worker's setup does),
         # so the streamed partial is set the way the worker would have it
         # after the earlier connection — before the settle, after the run.
-        gc.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
-        gc.STREAM_REASONING_TEXT[STREAM_ID] = "thinking hard"
-        gc.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = [
+        _config.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
+        _config.STREAM_REASONING_TEXT[STREAM_ID] = "thinking hard"
+        _config.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = [
             {"name": "shell", "args": {"cmd": "ls"}, "done": False}]
 
         harness = run_turn(
@@ -1931,7 +1887,7 @@ def test_status_lane_cancel_persists_partial_reasoning_and_tool_buffers():
         assert harness["result"][0] is None, harness["result"]
         # A prior connection streamed a partial answer before the socket
         # dropped; the durable status then resolved cancelled.
-        gc.STREAM_PARTIAL_TEXT[STREAM_ID] = "partial answer so far"
+        _config.STREAM_PARTIAL_TEXT[STREAM_ID] = "partial answer so far"
         # The production settle is invoked at TWO sites: inside the streaming
         # function's status-lane cancel branch (persist-first, round-4) and
         # at the worker caller (`if final_text is None: ...`) for the other
@@ -1974,9 +1930,9 @@ def test_status_lane_cancel_persists_partial_reasoning_and_tool_buffers():
             status_script=[{"status": "interrupted"}],
         )
         assert harness["result"][0] is None, harness["result"]
-        gc.STREAM_PARTIAL_TEXT[STREAM_ID] = "interrupted partial"
-        gc.STREAM_REASONING_TEXT[STREAM_ID] = ""
-        gc.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = []
+        _config.STREAM_PARTIAL_TEXT[STREAM_ID] = "interrupted partial"
+        _config.STREAM_REASONING_TEXT[STREAM_ID] = ""
+        _config.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = []
         gc._settle_gateway_cancelled_turn(sid, STREAM_ID)
         models.SESSIONS.pop(sid, None)
         reloaded = models.get_session(sid)
@@ -1984,13 +1940,13 @@ def test_status_lane_cancel_persists_partial_reasoning_and_tool_buffers():
         assert len(partials) == 2, f"interrupted lane must persist too, got {partials!r}"
         assert partials[1].get("content") == "interrupted partial"
     finally:
-        gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
-        gc.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
-        gc.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
+        _config.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+        _config.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
+        _config.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
         if saved_reasoning is not None:
-            gc.STREAM_REASONING_TEXT[STREAM_ID] = saved_reasoning
+            _config.STREAM_REASONING_TEXT[STREAM_ID] = saved_reasoning
         if saved_tools is not None:
-            gc.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = saved_tools
+            _config.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = saved_tools
         models.SESSION_DIR, models.SESSION_INDEX_FILE = saved_dir, saved_index
         models.SESSIONS.clear()
         models.SESSIONS.update(saved_sessions)
@@ -2015,8 +1971,8 @@ def test_status_lane_cancel_successor_owner_and_empty_output_controls():
     models.SESSION_DIR = pathlib.Path(tmp)
     models.SESSION_INDEX_FILE = pathlib.Path(tmp) / "_index.json"
     models.SESSIONS.clear()
-    saved_reasoning = gc.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
-    saved_tools = gc.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
+    saved_reasoning = _config.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
+    saved_tools = _config.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
     try:
         # (a) successor owner: the session moved on to another stream.
         sid = "sess-watchdog-cancel-successor"
@@ -2028,9 +1984,9 @@ def test_status_lane_cancel_successor_owner_and_empty_output_controls():
         session.pending_user_message = None
         session.save()
         models.SESSIONS[sid] = session
-        gc.STREAM_PARTIAL_TEXT[STREAM_ID] = "stale partial of the old turn"
-        gc.STREAM_REASONING_TEXT[STREAM_ID] = "stale reasoning"
-        gc.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = [{"name": "shell", "args": {}, "done": False}]
+        _config.STREAM_PARTIAL_TEXT[STREAM_ID] = "stale partial of the old turn"
+        _config.STREAM_REASONING_TEXT[STREAM_ID] = "stale reasoning"
+        _config.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = [{"name": "shell", "args": {}, "done": False}]
         harness = run_turn(
             urlopen_script=[FakeSseResponse([b": ping", b""], end="eof")],
             status_script=[{"status": "cancelled"}],
@@ -2051,9 +2007,9 @@ def test_status_lane_cancel_successor_owner_and_empty_output_controls():
         session.pending_started_at = None
         session.save()
         models.SESSIONS[sid] = session
-        gc.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
-        gc.STREAM_REASONING_TEXT[STREAM_ID] = ""
-        gc.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = []
+        _config.STREAM_PARTIAL_TEXT[STREAM_ID] = ""
+        _config.STREAM_REASONING_TEXT[STREAM_ID] = ""
+        _config.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = []
         harness = run_turn(
             urlopen_script=[FakeSseResponse([b": ping", b""], end="eof")],
             status_script=[{"status": "cancelled"}],
@@ -2070,13 +2026,13 @@ def test_status_lane_cancel_successor_owner_and_empty_output_controls():
             isinstance(m, dict) and m.get("role") == "user" and m.get("content") == "hi"
             for m in reloaded.messages)
     finally:
-        gc.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
-        gc.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
-        gc.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
+        _config.STREAM_PARTIAL_TEXT.pop(STREAM_ID, None)
+        _config.STREAM_REASONING_TEXT.pop(STREAM_ID, None)
+        _config.STREAM_LIVE_TOOL_CALLS.pop(STREAM_ID, None)
         if saved_reasoning is not None:
-            gc.STREAM_REASONING_TEXT[STREAM_ID] = saved_reasoning
+            _config.STREAM_REASONING_TEXT[STREAM_ID] = saved_reasoning
         if saved_tools is not None:
-            gc.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = saved_tools
+            _config.STREAM_LIVE_TOOL_CALLS[STREAM_ID] = saved_tools
         models.SESSION_DIR, models.SESSION_INDEX_FILE = saved_dir, saved_index
         models.SESSIONS.clear()
         models.SESSIONS.update(saved_sessions)
@@ -2339,7 +2295,7 @@ def main():
         test_r4_byte_silent_stream_probes_status_within_watchdog_budget,
         test_r4_stop_during_byte_silence_cancels_within_budget,
         test_r4_status_waiting_for_approval_surfaces_approval_card_once,
-        test_r4_settle_flow_has_single_continue_branch,
+        test_live_and_resumed_turns_share_one_recovery_procedure,
         test_r4_cancel_marker_scan_stops_at_turn_boundary,
         test_r4_status_lane_cancel_persists_before_cancel_event,
         test_r5_run_completed_breaks_out_of_infinite_postterminal_keepalives,
@@ -2347,7 +2303,6 @@ def main():
         test_r5_socket_reset_after_terminal_frame_returns_immediately,
         test_r5_postterminal_delta_frame_ignored,
         test_r6_status_approval_mirror_skipped_without_identity_fifo_replay_orders_a_b,
-        test_r6_identity_gateway_status_card_from_status_deduped_against_replay,
         test_r6_rejected_status_approval_payload_does_not_mask_replay,
         test_r7_observer_on_seq_still_advances_reconnect_cursor,
         test_r7_observer_off_reconnect_cursor_unchanged,

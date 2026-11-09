@@ -352,7 +352,8 @@ def test_api_safe_message_positions_drops_empty_tool_calls_array():
 
 def test_gateway_conversation_history_no_oob():
     from api.config import STREAM_PARTIAL_TEXT, STREAM_REASONING_TEXT
-    from api.gateway_chat import _STREAM_RUN_IDS, _run_gateway_runs_api_streaming
+    from api.gateway_chat import _STREAM_RUN_IDS
+    from api.gateway_transport_runs import _run_gateway_runs_api_streaming
 
     requests = []
     stream_id = "stream-oob-sanitization"

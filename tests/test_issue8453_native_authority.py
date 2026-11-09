@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import pytest
 
 from api import clarify, config, gateway_chat, gateway_sessions as sessions, models, profiles, routes
+from api import gateway_transport
 
 
 @pytest.fixture
@@ -47,7 +48,7 @@ def test_native_worker_uses_explicit_owner_config(owner_profiles, monkeypatch, p
     session.active_stream_id, session.pending_user_message = "owned-config", "hello"
     session.save()
     monkeypatch.setattr(gateway_chat, "_gateway_endpoint_for_profile", lambda _: ("http://unused.invalid", ""))
-    monkeypatch.setattr(gateway_chat, "gateway_supports_approval", lambda *a: False)
+    monkeypatch.setattr(gateway_transport, "gateway_supports_approval", lambda *a: False)
     monkeypatch.setattr(gateway_chat.urllib.request, "urlopen", MagicMock(side_effect=RuntimeError("unexpected REST fallback")))
     calls, events = [], []
 

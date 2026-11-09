@@ -12,6 +12,8 @@ from pathlib import Path
 import re
 import threading
 
+from api.gateway_transport import GatewayTransport, GatewayTurn, TurnOutcomeUnknown, TurnResult
+
 
 _LOCAL_SOURCES = frozenset({"cli", "tui", "desktop", "gui", "local", "acp"})
 _MESSAGING_SOURCES = frozenset({"telegram", "discord", "slack", "whatsapp", "signal",
@@ -25,7 +27,7 @@ class SessionTransportError(ValueError):
     """Bounded public failure; never a raw socket URL, credential or remote traceback."""
 
 
-class SessionTransportDisconnected(SessionTransportError):
+class SessionTransportDisconnected(SessionTransportError, TurnOutcomeUnknown):
     """Preserve the existing durable request so reopening recovers, never resends."""
 
 
@@ -205,7 +207,11 @@ class SessionRelay:
         self.epoch, self.sequence = None, -1
         self.approvals = {}
         self.clarifications = {}
-        self.text = ""
+        from api.gateway_projection import GatewayEventProjector, LiveTurnSnapshot
+        # The WebUI reconnect snapshot of this stream; stream content is
+        # projected onto it (and onto ``emit``) exactly as on the HTTP lanes.
+        self.live = LiveTurnSnapshot(stream_id, text="")
+        self.projector = GatewayEventProjector(self.live, lambda name, data: self.emit(name, data))
         # A saved request may have been admitted before its acknowledgement was
         # persisted. Cancellation or discovery failure cannot declare it unsent.
         self.attempted = recovering
@@ -289,7 +295,7 @@ class SessionRelay:
             # confirms the interrupt. Never auto-approve it or show a card.
             return
         self.approvals[prompt_id] = generation
-        data = _gateway_runs_approval_event({**payload, "approval_id": prompt_id})
+        data = _gateway_runs_approval_event(payload)
         if data is None:
             data = {"approval_id": prompt_id, "description": "Gateway tool approval", "choices": ["once", "deny"]}
         data.update(run_id=self.run_id, _gateway_agent_identity_v1=True)
@@ -307,8 +313,13 @@ class SessionRelay:
         else:
             self.event(frame)
 
+    @property
+    def text(self):
+        """The open answer segment streamed on this relay."""
+        return self.live.text
+
     def event(self, frame):
-        from api.gateway_chat import _append_gateway_stream_text, _note_live_gateway_event
+        from api.gateway_events import decode_session_event
         if frame.get("session_id") != self.canonical_session_id:
             return
         seq, epoch = frame.get("seq"), frame.get("replay_epoch")
@@ -322,23 +333,9 @@ class SessionRelay:
         if frame.get("admission_id") != (self.receipt or {}).get("admission_id"):
             return
         kind, payload = frame.get("type"), frame.get("payload") or {}
-        if kind == "message.delta":
-            text = payload.get("text") or payload.get("delta") or ""
-            if isinstance(text, str) and text:
-                self.text = _append_gateway_stream_text(self.stream_id, self.text, text)
-                self.emit("token", {"text": text})
-        elif kind in {"reasoning.delta", "thinking.delta"}:
-            data = {"text": payload.get("text") or payload.get("delta") or ""}
-            _note_live_gateway_event(self.stream_id, "reasoning", data)
-            self.emit("reasoning", data)
-        elif kind in {"tool.start", "tool.complete"}:
-            name = "tool" if kind == "tool.start" else "tool_complete"
-            data = {"name": payload.get("name") or payload.get("tool"),
-                    "tid": payload.get("tool_call_id") or payload.get("id"),
-                    "args": payload.get("args") or {},
-                    "is_error": bool(payload.get("is_error", payload.get("error", False)))}
-            _note_live_gateway_event(self.stream_id, name, data)
-            self.emit(name, data)
+        content = decode_session_event(kind, payload)
+        if content is not None:
+            self.projector.project(content)
         elif kind == "approval.request":
             self.approval(payload, frame.get("execution_generation"))
         elif kind == "clarify.request":
@@ -352,7 +349,7 @@ class SessionRelay:
             retire_gateway_pending_mirror(self.session_id, run_id=self.run_id, approval_id=prompt_id)
 
     async def run(self):
-        from api.gateway_chat import _adopt_gateway_stream_text, _publish_gateway_run_id
+        from api.gateway_chat import _publish_gateway_run_id
         from hermes_cli.gateway_client import GatewayRPCError
         self.loop = asyncio.get_running_loop()
         failures = 0
@@ -414,7 +411,7 @@ class SessionRelay:
                             if not isinstance(text, str):
                                 raise SessionTransportError("Gateway did not return a durable completion receipt.")
                             self.snapshot = await client.rpc("session.resume", session_id=self.canonical_session_id, display_projection=True)
-                            return _adopt_gateway_stream_text(self.stream_id, text), receipt.get("usage") or {}
+                            return self.live.adopt_text(text), receipt.get("usage") or {}
                         if receipt["status"] == "unknown":
                             raise SessionTransportDisconnected("Gateway turn outcome is unknown. Do not resend the message.")
                         if self.cancel.is_set():
@@ -498,3 +495,24 @@ def run_session(session, stream_id, text, *, emit, cancel, record, saved=None):
                          recovering=bool(saved))
     text, usage = asyncio.run(relay.run())
     return text, usage, relay.snapshot
+
+
+class SessionProtocolTransport(GatewayTransport):
+    """Run the turn over the Agent's canonical session protocol (``hermes-gateway-v1``).
+
+    Used to continue sessions another client owns (CLI, TUI, Desktop,
+    messaging). The Gateway owns admission, configuration and history; its
+    canonical transcript replaces the WebUI-built rows on success. A lost
+    connection with an unknown outcome raises ``SessionTransportDisconnected``
+    (a ``TurnOutcomeUnknown``) so the pending turn is preserved.
+    """
+
+    name = "session"
+    durable = True
+
+    def run(self, turn: GatewayTurn) -> TurnResult:
+        text, usage, snapshot = run_session(
+            turn.session, turn.stream_id, turn.msg_text, emit=turn.emit, cancel=turn.cancel_event,
+            record=turn.record_run, saved=turn.reattach_run,
+        )
+        return TurnResult(text=text, usage=usage, canonical_snapshot=snapshot)

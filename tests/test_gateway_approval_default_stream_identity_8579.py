@@ -37,9 +37,9 @@ from api.config import STREAMS, STREAMS_LOCK
 from api.gateway_chat import (
     _STREAM_RUN_IDS,
     _gateway_runs_approval_event,
-    _relay_gateway_run_approval,
     _run_gateway_chat_streaming,
 )
+from api.gateway_transport_runs import _relay_gateway_run_approval
 
 REPO_ROOT = Path(__file__).parent.parent
 
@@ -69,11 +69,11 @@ def _canonical_payload(**overrides):
 
 
 def _legacy_payload(**overrides):
-    """A legacy gateway: no execution_generation, older approval_id name."""
+    """An in-process Gateway approval: ``request_id``, no execution generation."""
     payload = {
         "event": "approval.request",
         "run_id": RUN_ID,
-        "approval_id": "appr-8579-legacy",
+        "request_id": "appr-8579-legacy",
         "tool": "shell",
         "command": "rm -rf /tmp/x",
         "description": "delete temp dir",
@@ -124,7 +124,7 @@ def _sse_body(payload: dict) -> bytes:
     ).encode("utf-8")
 
 
-def _drive_default_stream(sid, stream_id, payload, *, caps=None):
+def _drive_default_stream(sid, stream_id, payload):
     """Run the REAL default-stream approval branch over a faked gateway.
 
     Returns ``(events, click_state)``:
@@ -138,9 +138,6 @@ def _drive_default_stream(sid, stream_id, payload, *, caps=None):
       this is the state the user's click actually lands on. The stream here
       runs to completion, whose teardown retires the mirror, so
       ``_restore_click_state`` rebuilds exactly that state before a click.
-
-    ``caps`` patches ``gateway_supports_approval_identity_v1`` for the whole
-    drive; leave it None to leave the real probe in place.
     """
     events: list[tuple[str, dict]] = []
     click_state: dict = {}
@@ -170,10 +167,6 @@ def _drive_default_stream(sid, stream_id, payload, *, caps=None):
         patch("api.gateway_chat._stream_writeback_is_current", return_value=True),
         patch("api.gateway_chat.merge_session_messages_append_only", return_value=[]),
     ]
-    if caps is not None:
-        patches.append(
-            patch("api.config.gateway_supports_approval_identity_v1", return_value=caps)
-        )
     try:
         for ctx in patches:
             ctx.start()
@@ -294,56 +287,28 @@ class TestSharedIdentityDecision:
     """One decision, one definition, used by every card origin."""
 
     def test_generation_is_the_authority(self):
-        """A gateway that published a generation fences its prompts: v1."""
+        """A session-authority prompt is fenced by its generation: v1."""
         approval = _gateway_runs_approval_event(_canonical_payload())
         assert approval is not None
         assert approval["_gateway_execution_generation"] == 7
-        with patch("api.config.gateway_supports_approval_identity_v1", return_value=False):
-            assert gateway_chat._gateway_approval_identity_v1(approval, BASE_URL, "") is True
+        assert gateway_chat._gateway_approval_identity_v1(approval) is True
 
-    def test_capability_is_the_fallback(self):
-        """No generation, but the gateway advertises the capability: v1."""
+    def test_in_process_approval_is_not_v1(self):
+        """An in-process approval (request_id, no generation) uses the in-process body."""
         approval = _gateway_runs_approval_event(_legacy_payload())
         assert approval is not None
+        assert approval["approval_id"] == "appr-8579-legacy"
         assert approval["_gateway_execution_generation"] is None
-        with patch("api.config.gateway_supports_approval_identity_v1", return_value=True):
-            assert gateway_chat._gateway_approval_identity_v1(approval, BASE_URL, "") is True
+        assert gateway_chat._gateway_approval_identity_v1(approval) is False
 
-    def test_legacy_gateway_stays_legacy(self):
-        """No generation and no advertised capability: legacy body."""
-        approval = _gateway_runs_approval_event(_legacy_payload())
-        assert approval is not None
-        with patch("api.config.gateway_supports_approval_identity_v1", return_value=False):
-            assert gateway_chat._gateway_approval_identity_v1(approval, BASE_URL, "") is False
-
-    def test_never_promotes_a_local_fallback_id(self):
-        """A locally generated fallback id is not canonical identity.
-
-        ``_gateway_runs_approval_event`` mints a uuid when the gateway
-        published no id at all. That id was never sent by the gateway, so
-        answering with it is a guaranteed 400; it must not be promoted into
-        canonical identity even when the capability is advertised.
-        """
-        approval = _gateway_runs_approval_event({
+    def test_a_prompt_without_an_id_is_not_surfaced(self):
+        """Every Gateway prompt carries its id; an id-less one cannot be answered exactly."""
+        assert _gateway_runs_approval_event({
             "event": "approval.request",
             "run_id": RUN_ID,
             "command": "rm -rf /tmp/x",
             "description": "no id at all",
-        })
-        assert approval is not None
-        assert approval["_gateway_raw_approval_id_present"] is False
-        assert approval["approval_id"], "mapper still mints a browser-visible id"
-        with patch("api.config.gateway_supports_approval_identity_v1", return_value=True):
-            assert gateway_chat._gateway_approval_identity_v1(approval, BASE_URL, "") is False
-
-    def test_no_generation_and_no_raw_id_stays_legacy(self):
-        approval = _gateway_runs_approval_event({
-            "command": "rm -rf /tmp/x",
-            "description": "no id, no generation",
-        })
-        assert approval is not None
-        with patch("api.config.gateway_supports_approval_identity_v1", return_value=False):
-            assert gateway_chat._gateway_approval_identity_v1(approval, BASE_URL, "") is False
+        }) is None
 
     def test_helper_is_the_single_definition_used_by_both_origins(self):
         """The relay must not carry a second copy of the decision.
@@ -351,19 +316,17 @@ class TestSharedIdentityDecision:
         The maintainer's requirement is one shared creation-time decision; a
         duplicated expression in the relay would let the two origins drift.
         """
-        src = (REPO_ROOT / "api" / "gateway_chat.py").read_text(encoding="utf-8")
+        src = (REPO_ROOT / "api" / "gateway_transport_runs.py").read_text(encoding="utf-8")
         relay_start = src.index("def _relay_gateway_run_approval(")
         relay_end = src.index("\ndef ", relay_start + 10)
         relay_body = src[relay_start:relay_end]
         assert "_gateway_approval_identity_v1(" in relay_body, (
             "the Runs API relay must delegate to the shared identity helper"
         )
-        assert "_gateway_raw_approval_id_present" not in relay_body, (
-            "the relay must not re-derive the identity predicate inline"
-        )
-        stream_marker = 'if _payload_event in {"hermes.approval.request", "approval.request"}:'
-        assert stream_marker in src
-        stream_body = src[src.index(stream_marker):]
+        src = (REPO_ROOT / "api" / "gateway_transport_chat.py").read_text(encoding="utf-8")
+        stream_start = src.index("def _relay_chat_completion_approval(")
+        stream_end = src.find("\ndef ", stream_start + 10)
+        stream_body = src[stream_start:stream_end if stream_end >= 0 else len(src)]
         assert "_gateway_approval_identity_v1(" in stream_body, (
             "the default chat-completions stream must delegate to the shared identity helper"
         )
@@ -453,7 +416,7 @@ class TestDefaultStreamAllowAndDeny:
         sid = "sess-8579-legacy"
         stream_id = "stream-8579-legacy"
         events, click_state = _drive_default_stream(
-            sid, stream_id, _legacy_payload(), caps=False
+            sid, stream_id, _legacy_payload()
         )
         card = click_state["card"]
         assert card["approval_id"] == "appr-8579-legacy"
@@ -478,60 +441,14 @@ class TestDefaultStreamAllowAndDeny:
         assert captured["payload"] == {"ok": True, "choice": "once", "relayed": True}
         assert handler.send_response.call_args[0][0] == 200
 
-    def test_capability_advertised_gateway_relays_the_published_id(self):
-        """A gateway that advertises the capability answers with its own id."""
-        sid = "sess-8579-caps"
-        stream_id = "stream-8579-caps"
-        events, click_state = _drive_default_stream(
-            sid, stream_id, _legacy_payload(), caps=True
-        )
-        assert click_state["card"]["_gateway_agent_identity_v1"] is True
-
-        _restore_click_state(sid, stream_id, click_state)
-        mirror = approvals.gateway_pending_mirror(
-            sid, approval_id="appr-8579-legacy", run_id=RUN_ID
-        )
-        assert mirror is not None
-        assert mirror["_gateway_agent_identity_v1"] is True
-
-        captured: dict = {}
-        handler = _answer(
-            sid,
-            _click(sid, "appr-8579-legacy", mirror_token=mirror[approvals._GATEWAY_MIRROR_TOKEN]),
-            captured,
-        )
-        # No generation was published, so the body stays the legacy shape but
-        # carries the id the gateway itself sent — never a local fallback.
-        assert captured["body"] == {"choice": "once", "approval_id": "appr-8579-legacy"}
-        assert captured["status"] == 200
-        assert handler.send_response.call_args[0][0] == 200
-
-    def test_local_fallback_id_is_relayed_as_legacy_not_as_canonical(self):
-        """A card whose id WebUI minted itself is never answered as v1."""
+    def test_a_prompt_without_an_id_produces_no_card(self):
+        """WebUI never mints an id the Gateway did not publish."""
         sid = "sess-8579-fallback"
         stream_id = "stream-8579-fallback"
         payload = _canonical_payload(prompt_id=None, execution_generation=None)
-        events, click_state = _drive_default_stream(sid, stream_id, payload, caps=True)
-
-        minted = click_state["card"]["approval_id"]
-        assert minted
-        assert click_state["card"]["_gateway_agent_identity_v1"] is False, (
-            "a locally generated fallback id must not be promoted to canonical identity"
-        )
-
-        _restore_click_state(sid, stream_id, click_state)
-        mirror = approvals.gateway_pending_mirror(sid, approval_id=minted, run_id=RUN_ID)
-        assert mirror is not None
-
-        captured: dict = {}
-        handler = _answer(
-            sid,
-            _click(sid, minted, mirror_token=mirror[approvals._GATEWAY_MIRROR_TOKEN]),
-            captured,
-        )
-        assert captured["body"] == {"choice": "once", "approval_id": ""}
-        assert captured["status"] == 200
-        assert handler.send_response.call_args[0][0] == 200
+        events, click_state = _drive_default_stream(sid, stream_id, payload)
+        assert "card" not in click_state
+        assert not [item for item in events if item[0] == "approval"]
 
 
 # ---------------------------------------------------------------------------
@@ -602,7 +519,7 @@ class TestDefaultStreamPreservesExistingBehaviour:
         sid = "sess-8579-norun"
         stream_id = "stream-8579-norun"
         payload = _legacy_payload(run_id=None)
-        events, click_state = _drive_default_stream(sid, stream_id, payload, caps=False)
+        events, click_state = _drive_default_stream(sid, stream_id, payload)
 
         card = click_state["card"]
         assert card["approval_id"] == "appr-8579-legacy"
@@ -656,13 +573,12 @@ class TestDefaultStreamPreservesExistingBehaviour:
 class TestRunsApiOriginUnchanged:
     """The shared helper refactor must not move the Runs API path."""
 
-    def _relay(self, payload, *, caps=False, sid="sess-8579-runs"):
+    def _relay(self, payload, *, sid="sess-8579-runs"):
         events = []
-        with patch("api.config.gateway_supports_approval_identity_v1", return_value=caps):
-            assert _relay_gateway_run_approval(
-                sid, RUN_ID, payload, BASE_URL, "",
-                put_gateway_event=lambda name, data: events.append((name, data)),
-            )
+        assert _relay_gateway_run_approval(
+            sid, RUN_ID, payload, BASE_URL, "",
+            put_gateway_event=lambda name, data: events.append((name, data)),
+        )
         return events
 
     @pytest.mark.parametrize("choice", ["once", "deny"])
@@ -697,27 +613,20 @@ class TestRunsApiOriginUnchanged:
         events = self._relay(_legacy_payload())
         assert events[0][1]["_gateway_agent_identity_v1"] is False
 
-    def test_capability_advertised_card_still_relays_the_published_id(self):
-        events = self._relay(_legacy_payload(), caps=True)
-        assert events[0][1]["_gateway_agent_identity_v1"] is True
-
-    def test_local_fallback_id_is_not_canonical(self):
-        payload = {
-            "event": "approval.request",
-            "run_id": RUN_ID,
-            "command": "echo hi",
-            "description": "no id at all",
-        }
-        events = self._relay(payload, caps=True)
-        assert events[0][1]["_gateway_raw_approval_id_present"] is False
-        assert events[0][1]["_gateway_agent_identity_v1"] is False
+    def test_a_prompt_without_an_id_is_rejected(self):
+        events = []
+        assert _relay_gateway_run_approval(
+            "sess-8579-runs-noid", RUN_ID,
+            {"event": "approval.request", "run_id": RUN_ID, "command": "echo hi", "description": "no id"},
+            BASE_URL, "", put_gateway_event=lambda name, data: events.append((name, data)),
+        ) is False
+        assert events == []
 
     def test_translator_rejection_still_returns_false(self):
-        with patch("api.config.gateway_supports_approval_identity_v1", return_value=False):
-            assert _relay_gateway_run_approval(
-                "sess-8579-runs-reject", RUN_ID, {"risk_level": "high"}, BASE_URL, "",
-                put_gateway_event=lambda _n, _p: None,
-            ) is False
+        assert _relay_gateway_run_approval(
+            "sess-8579-runs-reject", RUN_ID, {"risk_level": "high"}, BASE_URL, "",
+            put_gateway_event=lambda _n, _p: None,
+        ) is False
 
 
 # ---------------------------------------------------------------------------
@@ -740,11 +649,10 @@ class TestStatusOriginSharesTheDecision:
             "description": "delete temp dir",
             "choices": ["once", "deny"],
         }
-        with patch("api.config.gateway_supports_approval_identity_v1", return_value=False):
-            assert _relay_gateway_run_approval(
-                sid, RUN_ID, status_approval, BASE_URL, "",
-                put_gateway_event=lambda name, data: events.append((name, data)),
-            )
+        assert _relay_gateway_run_approval(
+            sid, RUN_ID, status_approval, BASE_URL, "",
+            put_gateway_event=lambda name, data: events.append((name, data)),
+        )
         assert events and events[0][0] == "approval"
         assert events[0][1]["_gateway_agent_identity_v1"] is True
         assert events[0][1]["approval_id"] == PROMPT_ID
@@ -753,14 +661,13 @@ class TestStatusOriginSharesTheDecision:
         sid = "sess-8579-status-legacy"
         events = []
         status_approval = {
-            "approval_id": "appr-8579-status-legacy",
+            "request_id": "appr-8579-status-legacy",
             "tool": "shell",
             "command": "rm -rf /tmp/x",
             "description": "delete temp dir",
         }
-        with patch("api.config.gateway_supports_approval_identity_v1", return_value=False):
-            assert _relay_gateway_run_approval(
-                sid, RUN_ID, status_approval, BASE_URL, "",
-                put_gateway_event=lambda name, data: events.append((name, data)),
-            )
+        assert _relay_gateway_run_approval(
+            sid, RUN_ID, status_approval, BASE_URL, "",
+            put_gateway_event=lambda name, data: events.append((name, data)),
+        )
         assert events[0][1]["_gateway_agent_identity_v1"] is False

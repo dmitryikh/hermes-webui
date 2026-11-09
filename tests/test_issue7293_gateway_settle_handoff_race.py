@@ -37,6 +37,8 @@ import pytest
 import api.clarify as clarify
 import api.config as config
 import api.gateway_chat as gateway_chat
+from api import gateway_transport_runs as gateway_runs
+from api import gateway_transport
 import api.models as models
 import api.run_drain as run_drain
 import api.streaming as streaming
@@ -157,13 +159,13 @@ class _Launch:
             raise urllib.error.HTTPError(f"{base_url}/v1/runs/{run_id}/events", 404, "no", Message(), io.BytesIO(b""))
 
         monkeypatch.setattr(gateway_chat, "_record_gateway_run", record)
-        monkeypatch.setattr(gateway_chat, "_admit_gateway_run", admit)
-        monkeypatch.setattr(gateway_chat, "_open_gateway_run_events", no_event_replay)
+        monkeypatch.setattr(gateway_runs, "_admit_gateway_run", admit)
+        monkeypatch.setattr(gateway_runs, "_open_gateway_run_events", no_event_replay)
         monkeypatch.setattr(
-            gateway_chat, "_get_gateway_run_status",
+            gateway_runs, "_get_gateway_run_status",
             lambda base_url, api_key, run_id: {"run_id": run_id, "status": "completed", "output": ANSWER},
         )
-        monkeypatch.setattr(gateway_chat, "gateway_supports_approval", lambda *a, **k: True)
+        monkeypatch.setattr(gateway_transport, "gateway_supports_approval", lambda *a, **k: True)
         monkeypatch.setattr(gateway_chat, "stop_gateway_run", lambda run_id: self.stops.append(run_id) or True)
         self.thread = threading.Thread(target=self._work, name=f"gw-launch-{stream_id}", daemon=True)
 
@@ -373,7 +375,7 @@ def test_settle_racing_a_reattach_never_settles_the_resumable_run(isolated_sessi
         return {"run_id": run_id, "status": "completed", "output": ANSWER}
 
     stops: list = []
-    monkeypatch.setattr(gateway_chat, "_get_gateway_run_status", status)
+    monkeypatch.setattr(gateway_runs, "_get_gateway_run_status", status)
     monkeypatch.setattr(gateway_chat, "stop_gateway_run", lambda run_id: stops.append(run_id) or True)
 
     durable_at_publication: list[bool] = []

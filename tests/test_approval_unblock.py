@@ -635,9 +635,6 @@ class TestApprovalHTTPEndpoints:
 
         monkeypatch.setattr(r, "j", fake_j)
         monkeypatch.setattr("api.runner_client.HttpRunnerClient.respond_approval", fake_respond)
-        monkeypatch.setattr(
-            "api.config.gateway_supports_approval_identity_v1", lambda *_args: True
-        )
         with _lock:
             r._pending.pop(sid, None)
             r._gateway_queues[sid] = [head_entry, target_entry]

@@ -14,6 +14,7 @@ import pytest
 from api import models, run_journal
 from api.helpers import public_session_projection
 from api.run_journal import RunJournalWriter
+from api import gateway_transport_runs as gateway_runs
 from tests.test_cancel_restart_journal_recovery import (
     _assert_boundary_output_recovered,
     _isolated_state,  # noqa: F401 -- shared isolated fixture, no live state
@@ -279,7 +280,7 @@ def test_real_gateway_reattach_repairs_tail_before_journal_is_needed_again(tail,
     monkeypatch.setenv("HERMES_WEBUI_CHAT_BACKEND", "gateway")
     monkeypatch.setenv("HERMES_WEBUI_GATEWAY_USE_RUNS_API", "1")
     monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://gateway.local")
-    monkeypatch.setattr(gateway_chat, "GATEWAY_REATTACH_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(gateway_runs, "GATEWAY_REATTACH_POLL_INTERVAL", 0.01)
     sid, stream = _orphaned_gateway_turn()
     session = models.Session.load(sid)
     writer = RunJournalWriter(sid, stream)
@@ -288,7 +289,7 @@ def test_real_gateway_reattach_repairs_tail_before_journal_is_needed_again(tail,
     with path.open("ab") as fh:
         fh.write(tail)
     _forget_writer(path)
-    monkeypatch.setattr(gateway_chat, "_get_gateway_run_status", lambda *a, **kw: {
+    monkeypatch.setattr(gateway_runs, "_get_gateway_run_status", lambda *a, **kw: {
         "run_id": "run_survivor", "status": "completed", "output": "PREFIX",
     })
     assert gateway_chat.resume_gateway_runs_after_restart() == [sid]

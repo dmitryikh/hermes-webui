@@ -17,17 +17,32 @@ from api.config import PENDING_GOAL_CONTINUATION, STREAMS, create_stream_channel
 from api.models import new_session
 from api.gateway_chat import (
     _gateway_http_error_event,
-    _gateway_reasoning_delta,
-    _gateway_sse_delta,
-    _gateway_sse_reasoning_delta,
-    _gateway_stream_usage,
-    _gateway_tool_progress_event,
     _gateway_use_runs_api_enabled,
     gateway_chat_config_status,
     webui_chat_backend_mode,
     webui_gateway_chat_enabled,
 )
 from api.turn_journal import derive_turn_journal_states, read_turn_journal
+from api.gateway_events import (
+    ReasoningDelta,
+    TextDelta,
+    ToolProgress,
+    UsageReport,
+    decode_chat_completion_frame,
+    decode_runs_frame,
+    decode_session_event,
+    runs_usage,
+)
+from api.gateway_projection import tool_event
+from api.gateway_sse import SseFrame
+
+
+def _chat(payload, event="message"):
+    return decode_chat_completion_frame(SseFrame(event, json.dumps(payload))).events
+
+
+def _runs(payload):
+    return decode_runs_frame(SseFrame("message", json.dumps(payload))).events
 
 
 def test_gateway_chat_backend_is_default_off_for_truthy_values():
@@ -86,108 +101,68 @@ def test_gateway_chat_backend_env_wins_over_config_and_stays_safe():
     ) == "legacy"
 
 
-def test_gateway_sse_delta_extracts_openai_chat_chunks():
-    assert _gateway_sse_delta({"choices": [{"delta": {"content": "hel"}}]}) == "hel"
-    assert _gateway_sse_delta({"choices": [{"message": {"content": "done"}}]}) == "done"
-    assert _gateway_sse_delta({"choices": [{"delta": {}}]}) == ""
+def test_chat_completion_chunks_decode_text_reasoning_and_usage():
+    assert _chat({"choices": [{"delta": {"content": "hel"}}]}) == (TextDelta("hel"),)
+    assert _chat({"choices": [{"delta": {"reasoning_content": "Let me"}}]}) == (ReasoningDelta("Let me"),)
+    assert _chat({"choices": [{"delta": {"reasoning_content": "   "}}]}) == ()
+    assert _chat({"choices": [{"delta": {}}]}) == ()
+    # The finish chunk carries the OpenAI usage names.
+    assert _chat({"choices": [{"delta": {}, "finish_reason": "stop"}],
+                  "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}}) == (
+        UsageReport({"input_tokens": 7, "output_tokens": 3}),
+    )
 
 
-def test_gateway_stream_usage_normalizes_token_names():
-    assert _gateway_stream_usage({"usage": {"prompt_tokens": 7, "completion_tokens": 3}}) == {
-        "input_tokens": 7,
-        "output_tokens": 3,
-        "estimated_cost": 0,
+def test_runs_usage_uses_the_runs_api_token_names():
+    assert runs_usage({"usage": {"input_tokens": 5, "output_tokens": 2, "total_tokens": 7}}) == {
+        "input_tokens": 5, "output_tokens": 2,
     }
-    assert _gateway_stream_usage({"usage": {"input_tokens": 5, "output_tokens": 2, "estimated_cost_usd": 0.01}}) == {
-        "input_tokens": 5,
-        "output_tokens": 2,
-        "estimated_cost": 0.01,
-    }
-    assert _gateway_stream_usage({}) == {}
+    assert runs_usage({}) == {}
 
 
-def test_gateway_tool_progress_event_translates_gateway_lifecycle_payloads():
-    assert _gateway_tool_progress_event(
-        {
-            "tool": "terminal",
-            "label": "terminal: pytest",
-            "toolCallId": "call-1",
-            "status": "running",
-        }
-    ) == (
-        "tool",
-        {
-            "event_type": "tool.started",
-            "name": "terminal",
-            "preview": "terminal: pytest",
-            "args": {},
-            "is_error": False,
-            "tid": "call-1",
-        },
-    )
-    assert _gateway_tool_progress_event(
-        {"tool": "terminal", "toolCallId": "call-1", "status": "completed"}
-    ) == (
-        "tool_complete",
-        {
-            "event_type": "tool.completed",
-            "name": "terminal",
-            "preview": None,
-            "args": {},
-            "is_error": False,
-            "tid": "call-1",
-        },
-    )
-    assert _gateway_tool_progress_event(
-        {"tool": "_thinking", "status": "running", "preview": "Thinking..."}
-    ) == (
-        "reasoning",
-        {
-            "text": "Thinking...",
-        },
-    )
-    assert _gateway_tool_progress_event(
-        {"tool": "_thinking", "status": "running", "text": "Thinking from text..."}
-    ) == (
-        "reasoning",
-        {
-            "text": "Thinking from text...",
-        },
-    )
-    assert _gateway_tool_progress_event({"tool": "_thinking", "status": "running"}) is None
+def test_chat_completion_tool_progress_translates_to_webui_tool_events():
+    (started,) = _chat({"tool": "terminal", "emoji": "x", "label": "terminal: pytest",
+                        "toolCallId": "call-1", "status": "running"}, event="hermes.tool.progress")
+    assert tool_event(started) == ("tool", {
+        "event_type": "tool.started", "name": "terminal", "preview": "terminal: pytest",
+        "args": {}, "is_error": False, "tid": "call-1",
+    })
+    (completed,) = _chat({"tool": "terminal", "toolCallId": "call-1", "status": "completed"},
+                         event="hermes.tool.progress")
+    assert tool_event(completed) == ("tool_complete", {
+        "event_type": "tool.completed", "name": "terminal", "preview": None,
+        "args": {}, "is_error": False, "tid": "call-1",
+    })
+    # Internal tools never reach the wire, and are dropped if they do.
+    assert _chat({"tool": "_thinking", "toolCallId": "c", "status": "running"}, event="hermes.tool.progress") == ()
 
 
-def test_gateway_tool_progress_event_bounds_pathological_args():
+def test_runs_tool_and_reasoning_events_translate():
+    assert _runs({"event": "tool.started", "tool": "terminal", "preview": "pwd", "tool_call_id": "t1"}) == (
+        ToolProgress(completed=False, name="terminal", preview="pwd", tid="t1"),
+    )
+    assert _runs({"event": "tool.completed", "tool": "terminal", "duration": 0.1, "error": True,
+                  "tool_call_id": "t1", "preview": "boom"}) == (
+        ToolProgress(completed=True, name="terminal", preview="boom", is_error=True, tid="t1"),
+    )
+    assert _runs({"event": "reasoning.available", "text": " Let me"}) == (ReasoningDelta(" Let me"),)
+    assert _runs({"event": "reasoning.available", "text": "   "}) == ()
+
+
+def test_session_tool_event_bounds_pathological_args():
     long_command = "python -c " + repr("print('x')\n" * 24)
-    event_name, event_payload = _gateway_tool_progress_event(
-        {
-            "tool": "terminal",
-            "toolCallId": "call-huge",
-            "status": "running",
-            "args": {
-                "command": long_command,
-                "items": [{"index": i, "payload": "x" * 100} for i in range(50_000)],
-            },
-        }
-    )
-
+    event = decode_session_event("tool.start", {
+        "tool_id": "call-huge", "name": "terminal", "tool_call_id": "call-huge",
+        "args": {
+            "command": long_command,
+            "items": [{"index": i, "payload": "x" * 100} for i in range(50_000)],
+        },
+    })
+    event_name, event_payload = tool_event(event)
     assert event_name == "tool"
     assert event_payload["args"]["command"] == long_command
     assert len(event_payload["args"]["items"]) <= 64
     assert len(json.dumps(event_payload["args"], sort_keys=True)) < 100_000
-
-
-def test_gateway_reasoning_delta_keeps_string_deltas_and_ignores_structured_payloads():
-    assert _gateway_reasoning_delta({"text": " Let me"}) == " Let me"
-    assert _gateway_reasoning_delta({"text": "   ", "preview": " think"}) == " think"
-    assert _gateway_reasoning_delta({"content": {"text": "safe", "debug": {"note": "x"}}}) == ""
-    assert _gateway_reasoning_delta({"text": ["safe"], "preview": " more"}) == " more"
-
-
-def test_gateway_sse_reasoning_delta_extracts_reasoning_content_chunks():
-    assert _gateway_sse_reasoning_delta({"choices": [{"delta": {"reasoning_content": "Let me"}}]}) == "Let me"
-    assert _gateway_sse_reasoning_delta({"choices": [{"message": {"reasoning_content": "Done thinking"}}]}) == "Done thinking"
-    assert _gateway_sse_reasoning_delta({"choices": [{"delta": {"reasoning_content": "   "}}]}) == ""
 
 
 def test_gateway_http_401_reports_gateway_auth_not_provider_key():
@@ -291,10 +266,7 @@ def test_gateway_chat_worker_translates_sse_and_persists_session(tmp_path, monke
             yield b'event: hermes.tool.progress\n'
             yield b'data: {"tool":"terminal","label":"terminal: pytest","toolCallId":"call-1","status":"running"}\n\n'
             yield b'data: {"choices":[{"delta":{"content":"hel"}}]}\n\n'
-            yield b'event: hermes.tool.progress\n'
-            yield b'data: {"tool":"_thinking","text":"Thinking from tool progress"}\n\n'
-            yield b'event: reasoning.available\n'
-            yield b'data: {"text":"Reasoning preview", "preview":"Reasoning preview"}\n\n'
+            yield b'data: {"choices":[{"delta":{"reasoning_content":"Reasoning preview"}}]}\n\n'
             yield b'event: hermes.tool.progress\n'
             yield b'data: {"tool":"terminal","toolCallId":"call-1","status":"completed"}\n\n'
             yield b'data: {"choices":[{"delta":{"content":"lo"}}],"usage":{"prompt_tokens":4,"completion_tokens":2}}\n\n'
@@ -411,7 +383,6 @@ def test_gateway_chat_worker_translates_sse_and_persists_session(tmp_path, monke
         "is_error": False,
         "tid": "call-1",
     }) in event_pairs
-    assert ("reasoning", {"text": "Thinking from tool progress"}) in event_pairs
     assert ("reasoning", {"text": "Reasoning preview"}) in event_pairs
     assert ("tool_complete", {
         "event_type": "tool.completed",
@@ -583,9 +554,9 @@ def test_gateway_chat_worker_classifies_terminal_provider_error_without_text(tmp
         def __iter__(self):
             if response_error[0] == "partial":
                 yield b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'
-                yield f'data: {{"error":{json.dumps(error_text)}}}\n\n'.encode()
+                yield f'data: {{"choices":[{{"index":0,"delta":{{}},"finish_reason":"error"}}],"error":{{"message":{json.dumps(error_text)},"type":"agent_error"}}}}\n\n'.encode()
             elif response_error[0]:
-                yield f'data: {{"error":{json.dumps(response_error[0])}}}\n\n'.encode()
+                yield f'data: {{"choices":[{{"index":0,"delta":{{}},"finish_reason":"error"}}],"error":{{"message":{json.dumps(response_error[0])},"type":"agent_error"}}}}\n\n'.encode()
             yield b"data: [DONE]\n\n"
 
     monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://gateway.local")
@@ -780,9 +751,8 @@ def test_gateway_chat_worker_persists_reasoning_and_tool_state_on_terminal_error
             yield b'data: {"choices":[{"delta":{"content":"part"}}]}\n\n'
             yield b'event: hermes.tool.progress\n'
             yield b'data: {"tool":"terminal","label":"terminal: pytest","toolCallId":"call-1","status":"running","arguments":{}}\n\n'
-            yield b'event: reasoning.available\n'
-            yield b'data: {"text":"Preview reasoning"}\n\n'
-            yield f'data: {{"error":{json.dumps(error_text)}}}\n\n'.encode()
+            yield b'data: {"choices":[{"delta":{"reasoning_content":"Preview reasoning"}}]}\n\n'
+            yield f'data: {{"choices":[{{"index":0,"delta":{{}},"finish_reason":"error"}}],"error":{{"message":{json.dumps(error_text)},"type":"agent_error"}}}}\n\n'.encode()
             yield b"data: [DONE]\n\n"
 
     monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://gateway.local")
@@ -844,14 +814,10 @@ def test_gateway_chat_worker_preserves_reasoning_delta_whitespace_and_persists_r
 
         def __iter__(self):
             yield b'data: {"choices":[{"delta":{"content":"hel"}}]}\n\n'
-            yield b'event: hermes.tool.progress\n'
-            yield b'data: {"tool":"_thinking","text":"Let me"}\n\n'
-            yield b'event: reasoning.available\n'
-            yield b'data: {"text":" think", "preview":"should not win"}\n\n'
-            yield b'event: reasoning.available\n'
-            yield b'data: {"content":{"text":"safe","debug":{"note":"x"}}}\n\n'
-            yield b'event: reasoning.available\n'
-            yield b'data: {"preview":" more"}\n\n'
+            yield b'data: {"choices":[{"delta":{"reasoning_content":"Let me"}}]}\n\n'
+            yield b'data: {"choices":[{"delta":{"reasoning_content":" think"}}]}\n\n'
+            yield b'data: {"choices":[{"delta":{"reasoning_content":{"text":"safe","debug":{"note":"x"}}}}]}\n\n'
+            yield b'data: {"choices":[{"delta":{"reasoning_content":" more"}}]}\n\n'
             yield b'data: {"choices":[{"delta":{"content":"lo"}}]}\n\n'
             yield b'data: [DONE]\n\n'
 
@@ -1721,7 +1687,7 @@ def test_gateway_runs_api_body_includes_session_id():
 
     try:
         with patch.dict("os.environ", env, clear=True):
-            with patch("api.gateway_chat.gateway_supports_approval", return_value=True), \
+            with patch("api.gateway_transport.gateway_supports_approval", return_value=True), \
                  patch("urllib.request.urlopen", side_effect=fake_urlopen), \
                  patch("api.gateway_chat.get_session", return_value=MagicMock(
                      active_stream_id=stream_id, workspace="/tmp",
@@ -1771,8 +1737,7 @@ def test_gateway_runs_api_classifies_terminal_provider_error(tmp_path, monkeypat
             resp.read = lambda sz=65536: b'{"run_id":"run_error"}'
         else:
             resp.__iter__ = lambda s: iter([
-                b'event: run.failed\n',
-                f'data: {{"error":{json.dumps(error_text)}}}\n'.encode(),
+                f'data: {{"event":"run.failed","run_id":"run_error","seq":0,"error":{json.dumps(error_text)}}}\n'.encode(),
             ])
         return resp
 
@@ -1787,7 +1752,7 @@ def test_gateway_runs_api_classifies_terminal_provider_error(tmp_path, monkeypat
             "HERMES_WEBUI_GATEWAY_USE_RUNS_API": "1",
             "HERMES_WEBUI_GATEWAY_BASE_URL": "http://gateway.local",
         }, clear=True), \
-             patch("api.gateway_chat.gateway_supports_approval", return_value=True), \
+             patch("api.gateway_transport.gateway_supports_approval", return_value=True), \
              patch("urllib.request.urlopen", side_effect=fake_urlopen):
             _run_gateway_chat_streaming(
                 session_id=s.session_id,
@@ -1841,7 +1806,7 @@ def test_gateway_worker_skips_runs_api_when_opt_in_absent():
 
     try:
         with patch.dict("os.environ", env_without_opt_in, clear=True):
-            with patch("api.gateway_chat.gateway_supports_approval", return_value=True), \
+            with patch("api.gateway_transport.gateway_supports_approval", return_value=True), \
                  patch("urllib.request.urlopen", side_effect=fake_urlopen), \
                  patch("api.gateway_chat.get_session", return_value=MagicMock(
                      active_stream_id=stream_id, workspace="/tmp",

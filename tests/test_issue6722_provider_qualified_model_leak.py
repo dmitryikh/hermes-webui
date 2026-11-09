@@ -27,6 +27,7 @@ from collections import OrderedDict
 import json
 
 import api.gateway_chat as gateway_chat
+from api import gateway_transport_runs as gateway_runs
 import api.models as models
 import api.streaming as streaming
 from api.config import STREAMS, create_stream_channel
@@ -283,10 +284,10 @@ class TestGatewayRequestBodiesCarryBareModel:
             raise AssertionError("stop after the POST body is captured")
 
         monkeypatch.setattr(gateway_chat.urllib.request, "urlopen", fake_urlopen)
-        monkeypatch.setattr(gateway_chat, "update_active_run", lambda *a, **k: None)
+        monkeypatch.setattr(gateway_runs, "update_active_run", lambda *a, **k: None)
 
         try:
-            gateway_chat._run_gateway_runs_api_streaming(
+            gateway_runs._run_gateway_runs_api_streaming(
                 "sess-6722",
                 "hi",
                 "@custom:backup:model-a:free",

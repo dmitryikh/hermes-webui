@@ -13,23 +13,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from api.gateway_chat import _gateway_runs_approval_event
+from api.gateway_events import ApprovalRequest, decode_chat_completion_frame
+from api.gateway_sse import iter_sse_frames
+from api import gateway_transport_chat as gateway_chat_transport
 
 REPO_ROOT = Path(__file__).parent.parent
-GATEWAY_CHAT_SRC = (REPO_ROOT / "api" / "gateway_chat.py").read_text(encoding="utf-8")
-
-_LEGACY_MARKER = 'url = f"{base_url}/v1/chat/completions"'
-_NEXT_FUNC_RE = "\ndef "
-
-
-def _extract_legacy_sse_loop():
-    """Extract the legacy /v1/chat/completions SSE relay function body."""
-    start = GATEWAY_CHAT_SRC.find(_LEGACY_MARKER)
-    assert start >= 0, "Legacy chat/completions path not found in gateway_chat.py"
-    end = GATEWAY_CHAT_SRC.find(_NEXT_FUNC_RE, start)
-    if end < 0:
-        end = len(GATEWAY_CHAT_SRC)
-    return GATEWAY_CHAT_SRC[start:end]
-
 
 def _drain_queue(q):
     import queue
@@ -66,71 +54,72 @@ def _make_legacy_gateway_urlopen(approval_payload: str, after_approval=None):
     return fake_urlopen
 
 
-def test_legacy_loop_checks_approval_request_event():
-    """Legacy SSE loop must handle `approval.request` events."""
-    loop = _extract_legacy_sse_loop()
-    assert '"approval.request"' in loop, (
-        "Legacy SSE loop must check for approval.request event name"
+def _decode_lines(*lines):
+    """Frame (layer 1) and decode (layer 2) raw lines of the /v1/chat/completions stream."""
+    frames = [decode_chat_completion_frame(frame) for frame in iter_sse_frames(lines)]
+    return [frame for frame in frames if frame is not None]
+
+
+def test_chat_decoder_recognizes_the_named_approval_event():
+    """The Gateway announces a chat-stream approval as a named ``approval.request`` SSE event."""
+    payload = {"event": "approval.request", "run_id": "chatcmpl-1", "request_id": "a1", "command": "rm -rf /tmp/x"}
+    (frame,) = _decode_lines(b"event: approval.request", f"data: {json.dumps(payload)}".encode())
+    assert frame.events == (ApprovalRequest(payload),)
+
+
+def test_chat_decoder_approval_event_name_does_not_bleed():
+    """The SSE event name resets after the approval frame, so it cannot bleed into the next payload."""
+    frames = _decode_lines(
+        b"event: approval.request",
+        b'data: {"request_id": "a1", "command": "rm -rf /tmp/x"}',
+        b'data: {"choices": [{"delta": {"content": "next"}}]}',
     )
+    assert isinstance(frames[0].events[0], ApprovalRequest)
+    assert not any(isinstance(event, ApprovalRequest) for event in frames[1].events)
 
 
-def test_legacy_loop_checks_hermes_approval_request_event():
-    """Legacy SSE loop must handle `hermes.approval.request` events."""
-    loop = _extract_legacy_sse_loop()
-    assert '"hermes.approval.request"' in loop, (
-        "Legacy SSE loop must check for hermes.approval.request event name"
-    )
+def test_legacy_loop_dispatches_approvals_to_the_card_relay():
+    """The /v1/chat/completions transport hands decoded approvals to the shared card relay."""
+    import inspect
+
+    from api.gateway_transport_chat import ChatCompletionsTransport
+
+    loop = inspect.getsource(ChatCompletionsTransport.run)
+    assert "decode_chat_completion_frame(" in loop
+    assert "_relay_chat_completion_approval(" in loop
 
 
-def test_legacy_loop_derives_event_from_payload():
-    """Legacy SSE loop must derive event type from JSON payload fields."""
-    loop = _extract_legacy_sse_loop()
-    assert 'payload.get("event")' in loop or "payload.get('event')" in loop, (
-        "Legacy SSE loop must check payload JSON 'event' field"
-    )
+def test_legacy_card_relay_maps_mirrors_and_emits_the_approval():
+    """The card relay maps with _gateway_runs_approval_event, mirrors for polling, then emits the card."""
+    from api import gateway_chat
 
+    events, mirrored = [], []
 
-def test_legacy_loop_calls_put_gateway_event_approval():
-    """Legacy SSE loop must relay approval via put_gateway_event('approval', ...)."""
-    loop = _extract_legacy_sse_loop()
-    assert 'put_gateway_event("approval"' in loop, (
-        "Legacy SSE loop must call put_gateway_event with 'approval' event type"
-    )
+    def mirror(session_id, approval_data, cancel_event):
+        mirrored.append((session_id, approval_data["approval_id"]))
+        return {**approval_data, "mirrored": True}, 2
 
-
-def test_legacy_loop_calls_submit_gateway_pending_mirror():
-    """Legacy SSE loop must mirror approval to polling state."""
-    loop = _extract_legacy_sse_loop()
-    assert "submit_gateway_pending_mirror" in loop, (
-        "Legacy SSE loop must call submit_gateway_pending_mirror for polling fallback"
-    )
-
-
-def test_legacy_loop_reuses_gateway_runs_approval_event():
-    """Legacy SSE loop must reuse _gateway_runs_approval_event, not duplicate the mapping."""
-    loop = _extract_legacy_sse_loop()
-    assert "_gateway_runs_approval_event" in loop, (
-        "Legacy SSE loop must call _gateway_runs_approval_event to map the payload"
-    )
-
-
-def test_legacy_loop_resets_sse_event_after_approval():
-    """Legacy SSE loop must reset sse_event to 'message' after handling approval."""
-    loop = _extract_legacy_sse_loop()
-    approval_idx = loop.find('"hermes.approval.request"')
-    assert approval_idx >= 0
-    # Window sized to cover the whole approval handling block: the run_id
-    # recording (#4549 follow-up) and the creation-time identity decision
-    # (#8579) both live inside it, and the reset must still land before the
-    # next event branch so an approval cannot bleed into tool progress.
-    block_after = loop[approval_idx:approval_idx + 2600]
-    assert 'sse_event = "message"' in block_after, (
-        "Must reset sse_event to 'message' after approval handling to prevent bleed"
-    )
-    # The reset must be the approval branch's own, not a later branch's.
-    assert block_after.index('sse_event = "message"') < block_after.find(
-        'if sse_event == "hermes.tool.progress":'
-    ), "the approval branch must reset sse_event before the next event branch"
+    with patch.object(gateway_chat, "_submit_stream_approval_mirror", side_effect=mirror):
+        relayed = gateway_chat_transport._relay_chat_completion_approval(
+            "sid-legacy", "stream-legacy",
+            {"command": "rm -rf /tmp/x", "request_id": "a1", "run_id": "run-legacy"},
+            "http://gateway.test", "",
+            cancel_event=threading.Event(), put_gateway_event=lambda e, d: events.append((e, d)),
+        )
+        assert gateway_chat_transport._relay_chat_completion_approval(
+            "sid-legacy", "stream-legacy", {"risk_level": "high"}, "http://gateway.test", "",
+            cancel_event=threading.Event(), put_gateway_event=lambda e, d: events.append((e, d)),
+        ) is False
+    try:
+        assert relayed is True
+        assert mirrored == [("sid-legacy", "a1")]
+        assert [e for e, _ in events] == ["approval"]
+        card = events[0][1]
+        assert card["mirrored"] is True and card["pending_count"] == 2
+        assert card["_gateway_agent_identity_v1"] is False
+        assert gateway_chat._STREAM_RUN_IDS["stream-legacy"] == "run-legacy"
+    finally:
+        gateway_chat._STREAM_RUN_IDS.pop("stream-legacy", None)
 
 
 def test_approval_event_mapping_complete_payload():
@@ -140,7 +129,7 @@ def test_approval_event_mapping_complete_payload():
         "description": "Dangerous command approval",
         "pattern_key": "dangerous_command",
         "pattern_keys": ["dangerous_command"],
-        "approval_id": "appr-leg-1",
+        "request_id": "appr-leg-1",
         "choices": ["once", "session", "always", "deny"],
     })
     assert result is not None
@@ -186,7 +175,7 @@ def test_legacy_sse_loop_relays_approval_event():
         "description": "Delete temporary files",
         "pattern_key": "dangerous_command",
         "pattern_keys": ["dangerous_command"],
-        "approval_id": "appr-legacy-1",
+        "request_id": "appr-legacy-1",
         "choices": ["once", "session", "always", "deny"],
     })
     sse_body = (
@@ -216,7 +205,7 @@ def test_legacy_sse_loop_relays_approval_event():
 
     try:
         with patch.dict("os.environ", {"HERMES_WEBUI_CHAT_BACKEND": "gateway"}):
-            with patch("api.gateway_chat.gateway_supports_approval", return_value=False), \
+            with patch("api.gateway_transport.gateway_supports_approval", return_value=False), \
                  patch("urllib.request.urlopen", side_effect=fake_urlopen), \
                  patch("api.gateway_chat.get_session", return_value=mock_session), \
                  patch("api.gateway_chat._stream_writeback_is_current", return_value=True), \
@@ -286,7 +275,7 @@ def test_legacy_approval_records_run_id_for_response_relay():
         "description": "Delete temporary files",
         "pattern_key": "dangerous_command",
         "pattern_keys": ["dangerous_command"],
-        "approval_id": "appr-legacy-runid",
+        "request_id": "appr-legacy-runid",
         "run_id": "run-legacy-1",
         "choices": ["once", "session", "always", "deny"],
     })
@@ -317,7 +306,7 @@ def test_legacy_approval_records_run_id_for_response_relay():
 
     try:
         with patch.dict("os.environ", {"HERMES_WEBUI_CHAT_BACKEND": "gateway"}):
-            with patch("api.gateway_chat.gateway_supports_approval", return_value=False), \
+            with patch("api.gateway_transport.gateway_supports_approval", return_value=False), \
                  patch("urllib.request.urlopen", side_effect=fake_urlopen), \
                  patch("api.gateway_chat.get_session", return_value=mock_session), \
                  patch("api.gateway_chat._stream_writeback_is_current", return_value=True), \
@@ -404,7 +393,7 @@ def test_legacy_teardown_clears_stale_gateway_mirror_and_notifies_empty_state():
         "description": "Delete temporary files",
         "pattern_key": "dangerous_command",
         "pattern_keys": ["dangerous_command"],
-        "approval_id": "appr-legacy-teardown-stale",
+        "request_id": "appr-legacy-teardown-stale",
         "choices": ["once", "session", "always", "deny"],
         "run_id": "run-legacy-teardown-stale",
     }
@@ -439,7 +428,7 @@ def test_legacy_teardown_clears_stale_gateway_mirror_and_notifies_empty_state():
                 ra._gateway_queues.pop(session_id, None)
 
         with patch.dict("os.environ", {"HERMES_WEBUI_CHAT_BACKEND": "gateway"}):
-            with patch("api.gateway_chat.gateway_supports_approval", return_value=False), \
+            with patch("api.gateway_transport.gateway_supports_approval", return_value=False), \
                  patch("urllib.request.urlopen", side_effect=_make_legacy_gateway_urlopen(approval_payload, clear_gateway_queue)), \
                  patch("api.gateway_chat.get_session", return_value=mock_session), \
                  patch("api.gateway_chat._stream_writeback_is_current", return_value=True), \
@@ -483,7 +472,7 @@ def test_legacy_teardown_retires_live_gateway_head_mirror():
         "description": "Delete temporary files",
         "pattern_key": "dangerous_command",
         "pattern_keys": ["dangerous_command"],
-        "approval_id": "appr-legacy-teardown-live",
+        "request_id": "appr-legacy-teardown-live",
         "choices": ["once", "session", "always", "deny"],
         "run_id": "run-legacy-teardown-live",
     }
@@ -514,7 +503,7 @@ def test_legacy_teardown_retires_live_gateway_head_mirror():
             STREAMS[stream_id] = q
 
         with patch.dict("os.environ", {"HERMES_WEBUI_CHAT_BACKEND": "gateway"}):
-            with patch("api.gateway_chat.gateway_supports_approval", return_value=False), \
+            with patch("api.gateway_transport.gateway_supports_approval", return_value=False), \
                  patch("urllib.request.urlopen", side_effect=_make_legacy_gateway_urlopen(approval_payload)), \
                  patch("api.gateway_chat.get_session", return_value=mock_session), \
                  patch("api.gateway_chat._stream_writeback_is_current", return_value=True), \
@@ -563,7 +552,7 @@ def test_legacy_teardown_preserves_local_pending_entry():
         "description": "Delete temporary files",
         "pattern_key": "dangerous_command",
         "pattern_keys": ["dangerous_command"],
-        "approval_id": "appr-legacy-teardown-local",
+        "request_id": "appr-legacy-teardown-local",
         "choices": ["once", "session", "always", "deny"],
         "run_id": "run-legacy-teardown-local",
     }
@@ -594,7 +583,7 @@ def test_legacy_teardown_preserves_local_pending_entry():
             STREAMS[stream_id] = q
 
         with patch.dict("os.environ", {"HERMES_WEBUI_CHAT_BACKEND": "gateway"}):
-            with patch("api.gateway_chat.gateway_supports_approval", return_value=False), \
+            with patch("api.gateway_transport.gateway_supports_approval", return_value=False), \
                  patch("urllib.request.urlopen", side_effect=_make_legacy_gateway_urlopen(approval_payload)), \
                  patch("api.gateway_chat.get_session", return_value=mock_session), \
                  patch("api.gateway_chat._stream_writeback_is_current", return_value=True), \
@@ -794,7 +783,7 @@ def test_legacy_approval_without_run_id_retires_locally():
         "description": "Delete temporary files",
         "pattern_key": "dangerous_command",
         "pattern_keys": ["dangerous_command"],
-        "approval_id": "appr-legacy-no-run",
+        "request_id": "appr-legacy-no-run",
         "choices": ["once", "session", "always", "deny"],
     })
     sse_body = (
@@ -831,7 +820,7 @@ def test_legacy_approval_without_run_id_retires_locally():
 
     try:
         with patch.dict("os.environ", {"HERMES_WEBUI_CHAT_BACKEND": "gateway"}):
-            with patch("api.gateway_chat.gateway_supports_approval", return_value=False), \
+            with patch("api.gateway_transport.gateway_supports_approval", return_value=False), \
                  patch("urllib.request.urlopen", side_effect=fake_urlopen), \
                  patch("api.gateway_chat.get_session", return_value=mock_session), \
                  patch("api.gateway_chat._stream_writeback_is_current", return_value=True), \
@@ -976,8 +965,7 @@ def test_route_deny_settles_exact_non_head_run_producer():
         assert mirror is not None, "the non-head approval must be mirrored before it is answered"
 
         with patch("api.routes.j", new=fake_j), \
-             patch("api.runner_client.HttpRunnerClient.respond_approval", new=fake_respond), \
-             patch("api.config.gateway_supports_approval_identity_v1", return_value=True):
+             patch("api.runner_client.HttpRunnerClient.respond_approval", new=fake_respond):
             r._handle_approval_respond(
                 object(),
                 {

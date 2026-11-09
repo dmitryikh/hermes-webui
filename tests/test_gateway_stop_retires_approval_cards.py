@@ -51,6 +51,7 @@ import pytest
 
 import api.config as config
 import api.gateway_chat as gateway_chat
+from api import gateway_transport_chat as gateway_chat_transport
 import api.models as models
 import api.route_approvals as approvals
 import api.routes as routes
@@ -76,15 +77,15 @@ CANONICAL = {
     "choices": ["once", "session", "always", "deny"],
 }
 LEGACY = {
-    # A legacy Gateway: older approval_id name, no execution generation.
+    # An in-process Gateway approval: request_id, no execution generation.
     "event": "approval.request",
     "run_id": RUN_ID,
-    "approval_id": "appr-stop-retires-legacy",
+    "request_id": "appr-stop-retires-legacy",
     "tool": "terminal",
     "command": "rm -rf /tmp/stop-retires",
     "description": "delete temp dir",
 }
-GATEWAYS = pytest.mark.parametrize("payload", [CANONICAL, LEGACY], ids=["fenced", "legacy"])
+GATEWAYS = pytest.mark.parametrize("payload", [CANONICAL, LEGACY], ids=["fenced", "in_process"])
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +105,7 @@ def gateway_env(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", BASE_URL)
     monkeypatch.setattr(gateway_chat, "_gateway_endpoint_for_profile", lambda profile: (BASE_URL, ""))
     monkeypatch.setattr(gateway_chat, "_gateway_reasoning_effort_for_request", lambda *a, **k: None)
-    monkeypatch.setattr(gateway_chat, "gateway_approval_unavailable_reason", lambda *a, **k: None)
+    monkeypatch.setattr(gateway_chat_transport, "gateway_approval_unavailable_reason", lambda *a, **k: None)
     monkeypatch.setattr(streaming, "_load_webui_prefill_context", lambda cfg: {
         "status": "not_configured", "source": "none", "label": "", "message_count": 0, "messages": [],
     })
@@ -556,7 +557,7 @@ def test_card_parsed_while_stop_lands_is_not_published(gateway_env, monkeypatch,
             "a card published after the stop stays actionable for a stopped run"
         )
         card = {
-            "approval_id": payload.get("request_id") or payload.get("approval_id"),
+            "approval_id": payload["request_id"],
             "run_id": RUN_ID,
             "_gateway_mirror_token": "any",
         }
@@ -610,7 +611,7 @@ def test_card_cannot_be_published_after_stop_returned(gateway_env, monkeypatch, 
             "the worker published a card after Stop had returned"
         )
         card = {
-            "approval_id": payload.get("request_id") or payload.get("approval_id"),
+            "approval_id": payload["request_id"],
             "run_id": RUN_ID,
             "_gateway_mirror_token": "any",
         }

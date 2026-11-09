@@ -20,10 +20,8 @@ import pytest
 
 import api.route_approvals as approvals
 from api import routes
-from api.gateway_chat import (
-    _gateway_runs_approval_event,
-    _relay_gateway_run_approval,
-)
+from api.gateway_chat import _gateway_runs_approval_event
+from api.gateway_transport_runs import _relay_gateway_run_approval
 from api.runner_client import HttpRunnerClient
 
 SID = "sess-generation-approval"
@@ -48,17 +46,14 @@ def _canonical_payload(**overrides):
 
 
 def _relay(payload, *, put_event=None):
-    with patch(
-        "api.config.gateway_supports_approval_identity_v1", return_value=False
-    ):
-        return _relay_gateway_run_approval(
-            SID,
-            RUN_ID,
-            payload,
-            "http://gw:8642",
-            "",
-            put_gateway_event=put_event or (lambda _name, _payload: None),
-        )
+    return _relay_gateway_run_approval(
+        SID,
+        RUN_ID,
+        payload,
+        "http://gw:8642",
+        "",
+        put_gateway_event=put_event or (lambda _name, _payload: None),
+    )
 
 
 def _answer(
@@ -134,7 +129,6 @@ def test_mapper_keeps_prompt_id_and_execution_generation():
 
     assert event is not None
     assert event["approval_id"] == PROMPT_ID
-    assert event["_gateway_raw_approval_id_present"] is True
     assert event["_gateway_execution_generation"] == 7
 
 
@@ -148,16 +142,15 @@ def test_mapper_accepts_request_id_alias_used_by_the_session_bridge():
     assert event["_gateway_execution_generation"] == 7
 
 
-def test_mapper_legacy_payload_is_unchanged():
+def test_mapper_in_process_payload_has_no_generation():
     event = _gateway_runs_approval_event({
-        "approval_id": "appr-legacy",
+        "request_id": "appr-legacy",
         "command": "echo hi",
-        "description": "legacy approval",
+        "description": "in-process approval",
     })
 
     assert event is not None
     assert event["approval_id"] == "appr-legacy"
-    assert event["_gateway_raw_approval_id_present"] is True
     assert event["_gateway_execution_generation"] is None
 
 
@@ -256,7 +249,7 @@ def test_legacy_click_posts_at_once_without_a_status_read():
     payload = {
         "event": "approval.request",
         "run_id": RUN_ID,
-        "approval_id": "appr-legacy-1",
+        "request_id": "appr-legacy-1",
         "command": "echo hi",
         "description": "legacy approval",
         "choices": ["once", "deny"],
@@ -294,8 +287,6 @@ def test_yolo_auto_approve_also_carries_the_generation():
         return {"ok": True}
 
     with patch(
-        "api.config.gateway_supports_approval_identity_v1", return_value=False
-    ), patch(
         "api.gateway_chat._gateway_session_yolo_enabled", return_value=True
     ), patch(
         "api.runner_client.HttpRunnerClient._request_json", new=fake_request_json
